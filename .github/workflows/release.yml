@@ -1,0 +1,31 @@
+name: Build mod zip
+
+on:
+  push:
+    branches: [main]
+    paths: ['mod/**', '.github/workflows/release.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build zip
+        run: |
+          cd mod
+          zip -r ../realistic_tire_wear.zip . -x '.*'
+
+      - name: Update rolling latest release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="latest"
+          gh release delete "$TAG" --yes --cleanup-tag || true
+          gh release create "$TAG" realistic_tire_wear.zip \
+            --title "Latest build ($(date -u +%Y-%m-%d) @ ${GITHUB_SHA::7})" \
+            --notes "Auto-built from ${GITHUB_SHA}. Stable download URL: releases/latest/download/realistic_tire_wear.zip"
