@@ -1,0 +1,22 @@
+{
+  "domElement": "<alex-tire-wear></alex-tire-wear>",
+  "directive": "alexTireWear",
+  "name": "Realistic Tire Wear",
+  "description": "Per-tire wear percentage and tread temperature.",
+  "author": "alex",
+  "version": "1.0",
+  "types": [
+    "ui.apps.categories.vehicle_info",
+    "ui.apps.categories.racing",
+    "ui.apps.categories.info"
+  ],
+  "css": {
+    "top": "0px",
+    "left": "0px",
+    "width": "210px",
+    "height": "150px",
+    "min-width": "150px",
+    "min-height": "100px",
+    "border-radius": "8px"
+  }
+}
