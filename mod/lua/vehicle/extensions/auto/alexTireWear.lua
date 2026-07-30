@@ -34,11 +34,13 @@ local settings = {
 
   -- Wear. wear/s = wearRate * slipPower * tempWearMult(treadTemp), rate-capped.
   -- CALIBRATION KNOB #2 (wear only, independent of heating).
-  wearRate = 1.0e-7,
+  wearRate = 1.75e-7,
   -- Structural guard, not a tuning nicety: slipEnergy's true magnitude is unknown,
   -- so an uncapped rate means a large-magnitude vehicle destroys a tire in seconds.
-  -- This puts a hard floor on how fast a new tire can possibly reach the cords.
-  maxWearPerSecond = 1.0 / 150.0,
+  -- This puts a hard floor on how fast a new tire can possibly reach the cords:
+  -- 1/maxWearPerSecond seconds, i.e. 100 s here. It is what actually determines
+  -- burnout pacing, because a real burnout saturates the uncapped rate.
+  maxWearPerSecond = 1.0 / 100.0,
 
   -- Wear-vs-temperature multiplier breakpoints (degC).
   wearTempCold = 40.0,      -- at or below: wearMultCold
@@ -94,6 +96,39 @@ local settings = {
   overheatWarnTemp = 120.0,
   overheatClearTemp = 100.0,
 
+  -- Sparks from the contact patch once the tire is running on its steel belts.
+  -- Emitted with obj:addParticleByNodesRelative and particle type 1 (SPARKS) -- see
+  -- research.md sec.11 for why this and not a node-material swap.
+  sparksEnabled = true,
+  sparkTreadWindow = 0.2,    -- mm above treadDepthDead at which sparks begin
+  sparkMinSpeed = 2.0,       -- m/s wheel speed; below this, nothing is emitted
+  sparkMinLoad = 150.0,      -- N; the wheel has to actually be carrying weight
+  -- Emission rate. Bounded by design: the tick accumulator can fire at most once per
+  -- wheel per graphics frame, so the worst case is one particle call per wheel per frame.
+  sparkRateBase = 4.0,          -- emissions/s at a crawl
+  sparkRatePerSpeed = 0.8,      -- extra emissions/s per m/s
+  sparkCountBase = 1,           -- particles per emission
+  sparkCountPerSpeed = 1 / 12,  -- extra particles per emission per m/s
+  sparkCountMax = 4,
+  sparkVelBase = 1.0,           -- particle velocity away from the hub, m/s
+  sparkVelPerSpeed = 0.15,
+  sparkVelMax = 6.0,
+  sparkWidth = 0.05,
+  sparkParticleType = 1,        -- 1 == SPARKS (common/particles.json particle table)
+  -- Vanilla only defines spark particles for METAL on ASPHALT and METAL on METAL
+  -- (common/particles.json:72-73); dirt/grass/gravel get dust instead. Mirror that.
+  -- IDs are 1-based indices into that file's "materials" list, the same numbering
+  -- wheels.lua:341 uses for its spike-strip test (SPIKE_STRIP == 32).
+  sparkHardSurfacesOnly = true,
+  sparkSurfaces = {
+    [2] = true,   -- METAL
+    [10] = true,  -- ASPHALT
+    [11] = true,  -- ASPHALT_WET
+    [13] = true,  -- ROCK
+    [29] = true,  -- RUMBLE_STRIP
+    [30] = true,  -- COBBLESTONE
+  },
+
   streamName = "alexTireWear",
   uiUpdateInterval = 0.1,   -- seconds between UI stream pushes
   reinitInterval = 1.0,     -- seconds between self-heal wheel-list rescans
@@ -112,6 +147,8 @@ local reinitTimer = 0
 local debugTimer = 0
 local actuatorOk = true
 local actuatorChecked = false
+local sparksOk = true
+local sparksChecked = false
 local streamCache = {wheels = {}, count = 0, treadNew = 8.0, treadDead = 1.6}
 local srcTable = nil         -- the wheel table initState built activeList from
 local builtWheelCount = -1   -- candidate count of the source table we last built from
@@ -182,6 +219,7 @@ local function newState(name, cid, dataCid, wheelID)
     grip = 1.0, lastGrip = -1,       -- -1 forces one actuator write after init
     slipPower = 0, slipRaw = 0, rollPower = 0, brakeTemp = envTemp,
     wearWarn = 0, overheatWarned = false,
+    sparkTick = 0, sparkWarned = false, sparking = false,
   }
 end
 
@@ -192,6 +230,7 @@ local function resetState(st)
   st.grip, st.lastGrip = 1.0, -1
   st.slipPower, st.slipRaw, st.rollPower, st.brakeTemp = 0, 0, 0, envTemp
   st.wearWarn, st.overheatWarned = 0, false
+  st.sparkTick, st.sparkWarned, st.sparking = 0, false, false
 end
 
 local function warn(st, txt, channel)
@@ -250,6 +289,8 @@ local function initState()
   debugTimer = 0
   actuatorOk = true
   actuatorChecked = false
+  sparksOk = true
+  sparksChecked = false
   activeList = {}
 
   local wheelsTable, sourceCount, sourceName = pickWheelTable()
@@ -383,6 +424,93 @@ local function applyGrip(st, g)
   end
 end
 
+-- module-level so the pcall probe below never allocates a closure
+local function emitSparks(cid1, cid2, vel, ptype, width, count)
+  -- (cid1, cid2, velocity, particleType, width, count). Velocity is along the
+  -- cid2 -> cid1 axis; negative pushes the particles away from cid2, so with
+  -- cid2 = the hub node the spray goes outward, toward the road. Same call vanilla
+  -- uses for brake smoke off the disc (vehicle/wheels.lua:227).
+  obj:addParticleByNodesRelative(cid1, cid2, vel, ptype, width, count)
+end
+
+-- Sparks from the contact patch while the tire runs on its steel belts.
+local function updateSparks(st, wd, dt)
+  local s = settings
+  if st.popped or not (s.sparksEnabled and sparksOk) then
+    -- once the tire is deflated the game's own burst-tire behaviour takes over
+    st.sparkTick, st.sparking = 0, false
+    return
+  end
+
+  if treadDepth(st.wear) > s.treadDepthDead + s.sparkTreadWindow then
+    st.sparking = false
+    return
+  end
+
+  -- One-shot, regardless of whether the car is moving: the driver should be told the
+  -- moment the cords are exposed, not only once sparks happen to be visible.
+  if not st.sparkWarned then
+    st.sparkWarned = true
+    warn(st, string.format("%s tire on the cords!", tostring(st.name)), "cords")
+  end
+
+  local speed = abs(wd.wheelSpeed or 0)
+  if speed ~= speed or speed < s.sparkMinSpeed then st.sparking = false; return end
+
+  local load = wd.downForce or wd.downForceRaw or 0
+  if type(load) ~= "number" or load ~= load or load < s.sparkMinLoad then
+    st.sparking = false
+    return
+  end
+
+  if s.sparkHardSurfacesOnly then
+    -- A nil id means "we do not know"; only an id we positively recognise as soft
+    -- suppresses sparks, so a changed id convention cannot silently kill the feature.
+    local m1, m2 = wd.contactMaterialID1, wd.contactMaterialID2
+    local known = type(m1) == "number" or type(m2) == "number"
+    if known and not (s.sparkSurfaces[m1] or s.sparkSurfaces[m2]) then
+      st.sparking = false
+      return
+    end
+  end
+
+  st.sparking = true
+  -- Rate limiter, same shape as vanilla's brake-smoke tick (vehicle/wheels.lua:225):
+  -- at most one emission per wheel per graphics frame, whatever the rate works out to.
+  st.sparkTick = st.sparkTick > 1 and 0 or st.sparkTick + dt * (s.sparkRateBase + s.sparkRatePerSpeed * speed)
+  if st.sparkTick <= 1 then return end
+
+  local count = floor(s.sparkCountBase + s.sparkCountPerSpeed * speed)
+  if count < 1 then count = 1 elseif count > s.sparkCountMax then count = s.sparkCountMax end
+  local vel = s.sparkVelBase + s.sparkVelPerSpeed * speed
+  if vel > s.sparkVelMax then vel = s.sparkVelMax end
+
+  -- Prefer the actual tread node last in contact -- that is the contact patch
+  -- (vehicle/wheels.lua:105). Fall back to the hub axis if we have not seen one.
+  local hub = wd.node1
+  local cid1 = wd.lastTreadContactNode
+  local cid2 = hub
+  if not cid1 or cid1 == hub then
+    cid1, cid2 = hub, wd.node2
+  end
+  if not cid1 or not cid2 then return end
+
+  if sparksChecked then
+    emitSparks(cid1, cid2, -vel, s.sparkParticleType, s.sparkWidth, count)
+    return
+  end
+  -- first emission only: the exact argument shape of addParticleByNodesRelative is
+  -- inferred from vanilla call sites, not from a documented signature, so prove it
+  -- before trusting it every frame
+  local ok = pcall(emitSparks, cid1, cid2, -vel, s.sparkParticleType, s.sparkWidth, count)
+  if ok then
+    sparksChecked = true
+  else
+    sparksOk = false
+    if log then log("E", "alexTireWear", "addParticleByNodesRelative unavailable; cord sparks disabled") end
+  end
+end
+
 local function updateGFXInner(dt)
   dt = dt or 0
   local s = settings
@@ -436,6 +564,7 @@ local function updateGFXInner(dt)
       if wd.isTireDeflated or wd.isBroken or wd.hasTire == false then st.popped = true end
     else
       st.slipRaw, st.slipPower, st.rollPower = 0, 0, 0
+      st.sparkTick, st.sparking = 0, false
     end
 
     -- The one and only blowout path: the tread is gone. Deflation happens here, not in
@@ -451,6 +580,8 @@ local function updateGFXInner(dt)
     end
     st.grip = g
     if abs(g - st.lastGrip) > s.gripApplyEpsilon then applyGrip(st, g) end
+
+    if wd then updateSparks(st, wd, dt) end
 
     if not st.popped then
       -- staged driver warnings, in tread-depth terms
@@ -485,9 +616,10 @@ local function updateGFXInner(dt)
         for i = 1, n do
           local st = activeList[i]
           log("I", "alexTireWear", string.format(
-            "dbg %-6s slipRaw=%10.1f slipScaled=%10.1f tread=%6.1fC core=%6.1fC wear=%5.1f%% depth=%4.2fmm grip=%5.3f%s",
+            "dbg %-6s slipRaw=%10.1f slipScaled=%10.1f tread=%6.1fC core=%6.1fC wear=%5.1f%% depth=%4.2fmm grip=%5.3f%s%s",
             tostring(st.name), st.slipRaw, st.slipPower, st.treadTemp, st.coreTemp,
             st.wear * 100, treadDepth(st.wear), st.grip,
+            st.sparking and " SPARKS" or "",
             st.popped and " POPPED" or ""))
         end
       end
@@ -531,6 +663,7 @@ local function updateGFXInner(dt)
     e.coreTemp = st.coreTemp
     e.grip = st.grip
     e.popped = st.popped
+    e.sparking = st.sparking
     e.slipPower = st.slipPower   -- debug only; the app does not render it
     e.slipRaw = st.slipRaw       -- debug only
   end

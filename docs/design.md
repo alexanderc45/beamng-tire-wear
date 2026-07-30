@@ -65,6 +65,14 @@ is no overheat blowout): when tread depth reaches `treadDepthDead`
 Overheating punishes the driver only by accelerating tread loss
 (`tempWearMult`) and softening grip — it never pops a tire directly.
 
+**Cord sparks (added 2026-07-30, user request).** Once tread is within
+`sparkTreadWindow` (0.2 mm) of `treadDepthDead`, the contact patch throws spark
+particles (`obj:addParticleByNodesRelative`, particle type 1) while the wheel is
+rolling (≥2 m/s) under load (≥150 N) on a hard surface (asphalt/metal/rock —
+mirrors vanilla's spark material table). Intensity scales with speed via
+particle count and velocity, never call frequency (≤1 emission per wheel per
+frame). One-shot "tire on the cords!" warning at onset. `sparksEnabled` toggle.
+
 ## Driver feedback
 
 - `guihooks.message(msg, ttl, category, icon)` warnings, one-shot per stage per

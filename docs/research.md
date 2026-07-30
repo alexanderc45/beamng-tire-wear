@@ -1356,3 +1356,123 @@ the release notes + day-one forum evidence:
   actuator.
 - Unverified on 0.39 (no public Lua dump yet): `setFrictionThermalSensitivity` /
   `obj:getWheel` — no changelog mention, assumed present; the extension pcall-guards it.
+
+---
+
+## 11. Particle / spark API (2026-07-29)
+
+Researched to make a bald tire throw sparks off its steel belts. Sources: the ~0.36 Lua
+mirror, `common/particles.json`, and a runtime dump of the vehicle-side `obj` binding
+([`Feche/beam_dsx` `dumps/obj_dump.txt`](https://github.com/Feche/beam_dsx/blob/main/dumps/obj_dump.txt)).
+
+### 11.1 There are four particle entry points on `obj`
+
+From the `obj` dump, the full particle surface is:
+
+```
+addParticle
+addParticleByNodes
+addParticleByNodesRelative
+addParticleVelWidthTypeCount
+```
+
+Only three are used anywhere in the shipped Lua:
+
+| Call | Vanilla use |
+| --- | --- |
+| `obj:addParticleByNodesRelative(cid1, cid2, vel, particleType, width, count)` | fire, brake smoke, NOS, coolant steam, beam-break debris |
+| `obj:addParticleByNodes(cid1, cid2, vel, particleType, width, count)` | `fire.lua:457`, `controller/jato.lua:58` |
+| `obj:addParticleVelWidthTypeCount(nodeId, normal, nodeVel, veloMult, width, particleType, count)` | `particlefilter.lua:36` — the engine's own friction-particle path |
+
+**The argument shape is inferred, not documented.** There is no official reference for it;
+the official docs do not mention these functions at all, and the community
+`beamng-lua-stubs` project only auto-generates `param4/param5/param6` placeholders from
+vanilla call sites. The reading above is triangulated from consistent usage:
+
+- arg 3 is a **velocity along the `cid2` → `cid1` axis**; negative pushes particles *away*
+  from `cid2`. `fire.lua:95` uses `rand * -2` from a burning node relative to the vehicle
+  centre node (i.e. outward); `combustionEngineThermals.lua:412-415` uses `-15 / -10 / -20
+  / -8` for coolant jets of different strengths; `jato.lua:58` uses `20` for a thruster.
+- arg 5 is a **width / spread**, matching `addParticleVelWidthTypeCount`'s `width`
+  (`0` for most, `0.5` for `fire.lua`'s "spray of sparks", `0.01` for the jato jet).
+- arg 6 is a **count** (`100` for the fire spark spray, `15`, `1`).
+
+Given that, wrap the **first** call in a `pcall` and disable the feature on failure rather
+than erroring every frame. `addParticleByNodesRelative` is the right variant here: it is
+what `vehicle/wheels.lua:227` uses for brake smoke off the disc, and "Relative" means the
+vehicle's own motion carries the particles, so a spray trails behind properly.
+
+### 11.2 Particle type 1 is SPARKS
+
+`common/particles.json` carries the id table in a comment block above the `particles`
+array: `0 = UNDEF - not emitted`, **`1 = SPARKS`**, `2 = DUST_LIGHT`, … `14 =
+CHUNKS_SPARKS`. Note the comment list stops at 29 while vanilla Lua emits ids up to 81
+(brake smoke 48/49, coolant 61-64, NOS 70-72, jato 81), so the list is stale — but `1` is
+corroborated by the friction table in the same file.
+
+### 11.3 Why not swap the tread node material to METAL
+
+`obj:setNodeMaterial` **does exist** in the live `obj` binding (it is in the dump), but:
+
+1. **It is never called anywhere in the shipped Lua tree.** Node material is otherwise
+   only ever set at spawn, as the 21st argument of `obj:setNode(...)`
+   (`vehicle/jbeam/stage2.lua:210`, `nodeMaterialTypeID`). So its signature is entirely
+   unverified, and getting it wrong is a C++-side failure.
+2. **It would not produce the effect we want anyway.** The engine's friction-particle
+   table gates sparks on *sliding*:
+
+   ```
+   // common/particles.json:72-73
+   ["METAL", "ASPHALT", "X>2.5", "", 0.1, 1, 1, 1]
+   ["METAL", "METAL"  , "X>2.5", "", 0.1, 1, 1, 1]
+   ```
+
+   `X` is `slipVel`, so a METAL node only sparks above 2.5 m/s of *slip*. A bald tire
+   rolling normally has almost no slip velocity, so it would spark only during a
+   burnout or a slide — not while driving, which is exactly the case the feature is for.
+3. Node material also drives collision sound and physical material response, so swapping
+   it has side effects beyond visuals, and it would have to be reversed on repair/reset.
+
+Also worth noting from the same table: vanilla only defines *sparks* for METAL on ASPHALT
+and METAL on METAL. Dirt, grass, sand, mud and gravel all get dust/debris types instead
+(`particles.json:79-136`). A hard-surface whitelist is therefore the vanilla-consistent
+behaviour, not an arbitrary restriction.
+
+**Conclusion: emit explicitly with `addParticleByNodesRelative` + type 1.**
+
+### 11.4 Finding the contact patch, and gating on "actually on the ground"
+
+`wd.lastTreadContactNode` is the tread node most recently reported in contact, set in
+`wheels.nodeCollision` (`vehicle/wheels.lua:105`):
+
+```lua
+if obj:inSameNodeCluster(collisionNodeId, wheelRot.node1) then
+  wheelRot.lastTreadContactNode = collisionNodeId
+end
+```
+
+That is the contact patch, and it is what `vehicle/extensions/advancedwheeldebug.lua:41`
+and `wheels.lua:339` use. **It is never cleared**, though, so it goes stale the moment the
+wheel leaves the ground — it cannot be used as a ground-contact test. Gate on
+`wd.downForce` (and optionally `wd.contactDepth`) instead, and fall back to the
+`wd.node1` / `wd.node2` hub axis when no contact node has ever been seen.
+
+Ground-material ids are 1-based indices into `particles.json`'s `materials` list —
+METAL 2, ASPHALT 10, ASPHALT_WET 11, ROCK 13, DIRT 15, GRASS 20, RUMBLE_STRIP 29,
+COBBLESTONE 30, SPIKE_STRIP 32. The last one is independently confirmed by
+`vehicle/wheels.lua:341`, which tests `wd.contactMaterialID1 == 32` for the spike strip.
+
+### 11.5 Keeping the emission bounded
+
+Vanilla's own rate limiter, for brake smoke (`vehicle/wheels.lua:225-228`):
+
+```lua
+wd.smokeParticleTick = wd.smokeParticleTick > 1 and 0 or wd.smokeParticleTick + dt * 50 * min(..., 0.08)
+if wd.smokeParticleTick > 1 then
+  obj:addParticleByNodesRelative(wd.node1, wd.node2, 1 - random(1), particleType, 0, 1)
+end
+```
+
+The accumulator resets on the frame *after* it fires, so it emits at most once per wheel
+per graphics frame no matter how large the rate term gets. Copy that shape and scale
+visual intensity through `count` and `vel` rather than through call frequency.
