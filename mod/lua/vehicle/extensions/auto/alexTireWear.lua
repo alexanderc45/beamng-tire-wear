@@ -1,23 +1,44 @@
--- Realistic Tire Wear v1 -- per-wheel wear + thermal model.
+-- Realistic Tire Wear v1 -- per-wheel tread-depth + thermal model.
 -- Vehicle extension, auto-loaded from lua/vehicle/extensions/auto/ on every spawn.
 -- Global name is the file basename ("alexTireWear"), so it is namespaced already.
+--
+-- Tires are ALWAYS brand new on spawn and on reset: nothing is persisted (see the
+-- onSerialize note at the bottom).
 
 local M = {}
 
 -- ---------------------------------------------------------------------------
 -- Tuning. Every play-testable constant lives here and nowhere else.
+-- Every constant is re-read on each step, so live edits from the console take
+-- effect immediately:  alexTireWear.settings.slipEnergyScale = 0.1
 -- ---------------------------------------------------------------------------
 local settings = {
+  -- Per-wheel debug telemetry to the console (uiUpdateInterval-independent).
+  --   alexTireWear.settings.debug = true
+  debug = false,
+  debugInterval = 5.0,      -- seconds between debug lines per wheel
+
   -- CALIBRATION KNOB #1. wd.slipEnergy's units / whether it is already
   -- dt-integrated are unverified (research.md sec.8 item 1), so it is treated as an
   -- arbitrary-scale rate and the whole scale is absorbed here. If wear/heat come
   -- out uniformly too fast or too slow on the test machine, move this first --
   -- it scales heating and wear together, which is what you usually want.
-  slipEnergyScale = 1.0,
+  -- Deliberately conservative until we have a real magnitude off the test machine.
+  slipEnergyScale = 0.25,
 
-  -- Wear. wear/s = wearRate * slipPower * tempWearMult(treadTemp)
+  -- Tread depth, mm. Wear is integrated as a 0..1 scalar internally and mapped onto
+  -- this range for display / warnings / blowout. treadDepthDead is the cords-showing,
+  -- legal-limit point at which the tire is finished.
+  treadDepthNew = 8.0,
+  treadDepthDead = 1.6,
+
+  -- Wear. wear/s = wearRate * slipPower * tempWearMult(treadTemp), rate-capped.
   -- CALIBRATION KNOB #2 (wear only, independent of heating).
   wearRate = 1.0e-7,
+  -- Structural guard, not a tuning nicety: slipEnergy's true magnitude is unknown,
+  -- so an uncapped rate means a large-magnitude vehicle destroys a tire in seconds.
+  -- This puts a hard floor on how fast a new tire can possibly reach the cords.
+  maxWearPerSecond = 1.0 / 150.0,
 
   -- Wear-vs-temperature multiplier breakpoints (degC).
   wearTempCold = 40.0,      -- at or below: wearMultCold
@@ -38,10 +59,15 @@ local settings = {
   brakeHeatCoef = 0.002,        -- brake surface -> core; kept monotonic (never cools)
   brakeHeatMax = 2.0,           -- clamp on brake heat input, degC/s
   minTemp = -80.0,
-  maxTemp = 600.0,
+  -- Operative range ceiling. Not a physical melting point -- a numerical clamp, kept
+  -- near "smoking rubber" rather than at some absurd 600 degC so the displayed number
+  -- stays meaningful. tempWearMult already saturates at wearTempHot, so this value does
+  -- not affect wear rate.
+  maxTemp = 300.0,
   fallbackEnvTemp = 20.0,       -- if obj:getEnvTemperature() is unavailable
 
   -- Grip from wear: gentle decline, then a knee once the tread is nearly gone.
+  -- wearGripKnee 0.8 lands at ~2.9mm of tread, i.e. the low-tread zone.
   wearGripKnee = 0.8,
   wearGripAtKnee = 0.88,
   wearGripAtDead = 0.65,
@@ -57,32 +83,40 @@ local settings = {
   gripMin = 0.4,             -- hard floor on the actuated multiplier
   gripApplyEpsilon = 0.002,  -- only re-arm the actuator when grip moved this much
 
-  -- Blowout path B: sustained overheat, integrated (never an instant threshold).
-  heatDamageTemp = 140.0,          -- damage accumulates above this tread temp
-  heatDamageDegreeSeconds = 1200.0,-- degC*s above the threshold needed to burst
-  heatDamageRecovery = 0.02,       -- per second, once back below the threshold
+  -- There is exactly ONE blowout path: tread depletion. Temperature never bursts a
+  -- tire; it punishes the driver through tempWearMult instead (an overheated tire eats
+  -- its tread up to wearMultHot times faster) and through gripFromTemp.
 
-  -- Driver warnings (one-shot per stage, per tire, reset on vehicle reset).
+  -- Driver warnings (one-shot per stage, per tire, reset with the vehicle).
   wearWarnStages = {0.5, 0.75, 0.9},
-  heatWarnStages = {0.5, 0.85},
+  -- Overheat advisory, with hysteresis so it cannot chatter. Re-arms once the tread
+  -- drops back below overheatClearTemp.
+  overheatWarnTemp = 120.0,
+  overheatClearTemp = 100.0,
 
   streamName = "alexTireWear",
-  uiUpdateInterval = 0.1,  -- seconds between UI stream pushes
+  uiUpdateInterval = 0.1,   -- seconds between UI stream pushes
+  reinitInterval = 1.0,     -- seconds between self-heal wheel-list rescans
 }
 
 -- ---------------------------------------------------------------------------
 
-local min, max, abs, floor = math.min, math.max, math.abs, math.floor
+local abs, floor = math.abs, math.floor
 
 local wheelStates = {}    -- wheel name -> state (name is stable across cid churn)
 local activeList = {}     -- cid-sorted array of the states we integrate
-local pendingRestore = nil
 local envTemp = settings.fallbackEnvTemp
 local coolMult = 1.0
 local uiTimer = 0
+local reinitTimer = 0
+local debugTimer = 0
 local actuatorOk = true
 local actuatorChecked = false
-local streamCache = {wheels = {}}
+local streamCache = {wheels = {}, count = 0, treadNew = 8.0, treadDead = 1.6}
+local srcTable = nil         -- the wheel table initState built activeList from
+local builtWheelCount = -1   -- candidate count of the source table we last built from
+local beaconCount = -1       -- last count we logged, so re-inits only log on change
+local gfxErrorLogged = false
 
 local function getEnvTemp()
   if obj and obj.getEnvTemperature then
@@ -90,6 +124,13 @@ local function getEnvTemp()
     if type(t) == "number" and t == t then return t - 273.15 end
   end
   return settings.fallbackEnvTemp
+end
+
+-- wear 0..1  ->  remaining tread depth in mm
+local function treadDepth(w)
+  local s = settings
+  if w < 0 then w = 0 elseif w > 1 then w = 1 end
+  return s.treadDepthNew - w * (s.treadDepthNew - s.treadDepthDead)
 end
 
 local function tempWearMult(t)
@@ -125,24 +166,32 @@ local function gripFromTemp(t)
   return 1.0 + (s.gripHotMult - 1.0) * (t - s.gripTempOptHigh) / (s.gripHotTemp - s.gripTempOptHigh)
 end
 
-local function newState(name, cid, wheelID)
+-- Three different ids per wheel, and they are NOT interchangeable:
+--   cid      -- the key in the table we iterate. For wheels.wheelRotators that really is
+--              wd.cid, but for wheels.wheels after initSecondStage it is a sequential
+--              counter (vehicle/wheels.lua:1104). Use it only to index that same table.
+--   dataCid  -- wd.cid, i.e. the key into v.data.wheels. This is what
+--              beamstate.deflateTire() expects (it does v.data.wheels[arg];
+--              vanilla passes wd.cid at vehicle/wheels.lua:341).
+--   wheelID  -- what obj:getWheel() expects (vanilla, vehicle/wheels.lua:915).
+local function newState(name, cid, dataCid, wheelID)
   return {
-    name = name, cid = cid, wheelID = wheelID,
-    wear = 0, treadTemp = envTemp, coreTemp = envTemp, heatDamage = 0,
+    name = name, cid = cid, dataCid = dataCid, wheelID = wheelID,
+    wear = 0, treadTemp = envTemp, coreTemp = envTemp,
     popped = false,
     grip = 1.0, lastGrip = -1,       -- -1 forces one actuator write after init
-    slipPower = 0, rollPower = 0, brakeTemp = envTemp,
-    wearWarn = 0, heatWarn = 0,
+    slipPower = 0, slipRaw = 0, rollPower = 0, brakeTemp = envTemp,
+    wearWarn = 0, overheatWarned = false,
   }
 end
 
 local function resetState(st)
-  st.wear, st.heatDamage = 0, 0
+  st.wear = 0
   st.treadTemp, st.coreTemp = envTemp, envTemp
   st.popped = false
   st.grip, st.lastGrip = 1.0, -1
-  st.slipPower, st.rollPower, st.brakeTemp = 0, 0, envTemp
-  st.wearWarn, st.heatWarn = 0, 0
+  st.slipPower, st.slipRaw, st.rollPower, st.brakeTemp = 0, 0, 0, envTemp
+  st.wearWarn, st.overheatWarned = 0, false
 end
 
 local function warn(st, txt, channel)
@@ -155,43 +204,68 @@ local function popTire(st, reason)
   if st.popped then return end
   st.popped = true
   st.grip, st.lastGrip = settings.gripMin, -1
-  local wd = wheels and wheels.wheels and wheels.wheels[st.cid]
+  local wd = srcTable and srcTable[st.cid]
   if wd and not wd.isTireDeflated and not wd.isBroken and beamstate and beamstate.deflateTire then
-    beamstate.deflateTire(st.cid)
+    beamstate.deflateTire(st.dataCid)
   end
-  warn(st, string.format("%s tire blowout (%s)", tostring(st.name), reason), "blowout")
+  warn(st, string.format("%s tire blowout -- %s", tostring(st.name), reason), "blowout")
 end
 
-local function applyRestore()
-  if not pendingRestore then return end
-  for i = 1, #activeList do
-    local st = activeList[i]
-    local d = pendingRestore[st.name]
-    if type(d) == "table" then
-      if type(d.wear) == "number" then st.wear = max(0, min(1, d.wear)) end
-      if type(d.treadTemp) == "number" then st.treadTemp = d.treadTemp end
-      if type(d.coreTemp) == "number" then st.coreTemp = d.coreTemp end
-      if type(d.heatDamage) == "number" then st.heatDamage = max(0, min(1, d.heatDamage)) end
-      if type(d.wearWarn) == "number" then st.wearWarn = d.wearWarn end
-      if type(d.heatWarn) == "number" then st.heatWarn = d.heatWarn end
-      st.popped = d.popped == true
-      st.lastGrip = -1
-    end
+-- How many entries of a wheel table we would track. Kept in sync with the filter
+-- used by initState below, so the cheap "did the wheel setup change?" check in
+-- updateGFX cannot disagree with what we actually built.
+local function candidateCount(tbl)
+  if type(tbl) ~= "table" then return 0 end
+  local n = 0
+  for _, wd in pairs(tbl) do
+    if type(wd) == "table" and wd.hasTire ~= false then n = n + 1 end
   end
-  pendingRestore = nil
+  return n
 end
 
--- Idempotent: rebuilds the wheel list, keeps existing wear unless fresh == true.
-local function initState(fresh)
+-- `wheels.wheels` is the normal source, but note it is NOT cid-keyed after
+-- wheels.initSecondStage(): that function does `M.wheels = {}` and re-fills it with a
+-- *sequential* index, keeping only entries whose rotatorType == "wheel"
+-- (vehicle/wheels.lua:1082-1106). So a vehicle whose tires are not plain "wheel"
+-- rotators, or one whose second-stage init bailed out early on missing refNodes, can
+-- leave wheels.wheels empty while wheels.wheelRotators is fully populated. Fall back to
+-- wheelRotators in that case rather than silently tracking nothing.
+local function pickWheelTable()
+  local w = wheels and wheels.wheels
+  local n = candidateCount(w)
+  if n > 0 then return w, n, "wheels.wheels" end
+  local r = wheels and wheels.wheelRotators
+  n = candidateCount(r)
+  if n > 0 then return r, n, "wheels.wheelRotators" end
+  return nil, 0, "none"
+end
+
+-- Rebuilds the wheel list. Tires always start new, so this is unconditionally fresh;
+-- it is safe to call repeatedly (the self-heal rescan in updateGFX does).
+local function initState()
   envTemp = getEnvTemp()
   coolMult = 1.0
   uiTimer = 0
+  reinitTimer = 0
+  debugTimer = 0
   actuatorOk = true
   actuatorChecked = false
   activeList = {}
 
-  local wheelsTable = wheels and wheels.wheels
-  if type(wheelsTable) ~= "table" then return end
+  local wheelsTable, sourceCount, sourceName = pickWheelTable()
+  builtWheelCount = sourceCount
+  srcTable = wheelsTable
+  if not wheelsTable then
+    wheelStates = {}
+    if beaconCount ~= 0 then
+      beaconCount = 0
+      if log then
+        log("W", "alexTireWear",
+          "loaded, tracking 0 tires -- no usable entries in wheels.wheels or wheels.wheelRotators (will rescan)")
+      end
+    end
+    return
+  end
 
   local kept = {}
   for cid, wd in pairs(wheelsTable) do
@@ -202,11 +276,12 @@ local function initState(fresh)
       if kept[name] then name = name .. "#" .. tostring(cid) end
       local st = wheelStates[name]
       if not st then
-        st = newState(name, cid, wd.wheelID or cid)
+        st = newState(name, cid, wd.cid or cid, wd.wheelID or cid)
       else
         st.cid = cid
+        st.dataCid = wd.cid or cid
         st.wheelID = wd.wheelID or cid
-        if fresh then resetState(st) end
+        resetState(st)
       end
       kept[name] = st
       activeList[#activeList + 1] = st
@@ -217,10 +292,23 @@ local function initState(fresh)
   -- deterministic iteration order (pairs() over the wheel table is not)
   table.sort(activeList, function(a, b) return (a.cid or 0) < (b.cid or 0) end)
 
-  if not fresh then applyRestore() else pendingRestore = nil end
-
   -- Without this, M.onPhysicsStep silently never fires (vehicle/main.lua gates it).
   if type(enablePhysicsStepHook) == "function" then enablePhysicsStepHook() end
+
+  -- Load beacon. "Is the extension even running, and on how many tires?" has to be
+  -- answerable from the console log alone. Logged on first init and again whenever a
+  -- rescan changes the count; silent on the redundant onExtensionLoaded/onVehicleLoaded
+  -- double-call and on plain resets.
+  local n = #activeList
+  if n ~= beaconCount then
+    beaconCount = n
+    if log then
+      local names = {}
+      for i = 1, n do names[i] = tostring(activeList[i].name) end
+      log(n > 0 and "I" or "W", "alexTireWear",
+        string.format("loaded, tracking %d tires from %s [%s]", n, sourceName, table.concat(names, ", ")))
+    end
+  end
 end
 
 -- ---------------------------------------------------------------------------
@@ -234,6 +322,7 @@ local function onPhysicsStep(dtPhys)
   local s = settings
   local envT, cool = envTemp, coolMult
   local loT, hiT = s.minTemp, s.maxTemp
+  local wearCap = s.maxWearPerSecond
 
   for i = 1, n do
     local st = list[i]
@@ -254,16 +343,10 @@ local function onPhysicsStep(dtPhys)
       st.treadTemp, st.coreTemp = tt, tc
 
       if slipPower > 0 and st.wear < 1 then
-        local w = st.wear + s.wearRate * slipPower * tempWearMult(tt) * dtPhys
+        local rate = s.wearRate * slipPower * tempWearMult(tt)
+        if rate > wearCap then rate = wearCap end
+        local w = st.wear + rate * dtPhys
         st.wear = w < 1 and w or 1
-      end
-
-      if tt > s.heatDamageTemp then
-        local hd = st.heatDamage + (tt - s.heatDamageTemp) * dtPhys / s.heatDamageDegreeSeconds
-        st.heatDamage = hd < 1 and hd or 1
-      elseif st.heatDamage > 0 then
-        local hd = st.heatDamage - s.heatDamageRecovery * dtPhys
-        st.heatDamage = hd > 0 and hd or 0
       end
     end
   end
@@ -273,21 +356,24 @@ end
 -- Graphics rate. Samples fresh wheel data, drives the actuator, pops tires,
 -- warns the driver, feeds the UI stream.
 -- ---------------------------------------------------------------------------
+-- module-level so the pcall probe below never allocates a closure
+local function setGrip(wobj, g)
+  -- flatten the (jbeam-default-neutral) temperature curve and repurpose the three
+  -- friction coefficients as one whole-wheel grip multiplier
+  wobj:setFrictionThermalSensitivity(-300, 1e7, 1e-10, 1e-10, 10, g, g, g)
+end
+
 local function applyGrip(st, g)
   if not actuatorOk then return end
   local wobj = obj and obj.getWheel and obj:getWheel(st.wheelID)
   if not wobj then return end
-  -- flatten the (jbeam-default-neutral) temperature curve and repurpose the three
-  -- friction coefficients as one whole-wheel grip multiplier
   if actuatorChecked then
-    wobj:setFrictionThermalSensitivity(-300, 1e7, 1e-10, 1e-10, 10, g, g, g)
+    setGrip(wobj, g)
     st.lastGrip = g
     return
   end
   -- first call only: verify the API exists on this game version before trusting it
-  local ok = pcall(function()
-    wobj:setFrictionThermalSensitivity(-300, 1e7, 1e-10, 1e-10, 10, g, g, g)
-  end)
+  local ok = pcall(setGrip, wobj, g)
   if ok then
     actuatorChecked = true
     st.lastGrip = g
@@ -297,13 +383,28 @@ local function applyGrip(st, g)
   end
 end
 
-local function updateGFX(dt)
-  local wheelsTable = wheels and wheels.wheels
-  if type(wheelsTable) ~= "table" then return end
-  local n = #activeList
-  if n == 0 then return end
-
+local function updateGFXInner(dt)
+  dt = dt or 0
   local s = settings
+
+  -- Self-heal. onExtensionLoaded / onVehicleLoaded fire after wheels.init() and
+  -- wheels.initSecondStage(), so the wheel list is normally ready by then -- but if a
+  -- vehicle ever populates or re-shapes its wheel tables later (or does it in a way our
+  -- filter rejects at spawn time), a one-shot init would leave us tracking nothing
+  -- forever with no callback to recover from. Rescan at 1 Hz whenever we have nothing,
+  -- or whenever the live wheel count no longer matches what we built from.
+  reinitTimer = reinitTimer + dt
+  if reinitTimer >= s.reinitInterval then
+    reinitTimer = 0
+    local _, liveCount = pickWheelTable()
+    if liveCount > 0 and (#activeList == 0 or liveCount ~= builtWheelCount) then
+      initState()
+    end
+  end
+
+  local wheelsTable = srcTable
+  local n = #activeList
+
   envTemp = getEnvTemp()
   local ev = electrics and electrics.values
   local airspeed = 0
@@ -313,12 +414,13 @@ local function updateGFX(dt)
 
   for i = 1, n do
     local st = activeList[i]
-    local wd = wheelsTable[st.cid]
+    local wd = wheelsTable and wheelsTable[st.cid]
     if wd then
       -- latch physics-loop inputs. wheels.updateGFX refreshed these just before
       -- this hook, so read them rather than re-calling the C++ getter.
       local slipEnergy = wd.slipEnergy
       if type(slipEnergy) ~= "number" or slipEnergy ~= slipEnergy or slipEnergy < 0 then slipEnergy = 0 end
+      st.slipRaw = slipEnergy
       st.slipPower = slipEnergy * s.slipEnergyScale
 
       local load = wd.downForce or wd.downForceRaw or 0
@@ -333,17 +435,13 @@ local function updateGFX(dt)
 
       if wd.isTireDeflated or wd.isBroken or wd.hasTire == false then st.popped = true end
     else
-      st.slipPower, st.rollPower = 0, 0
+      st.slipRaw, st.slipPower, st.rollPower = 0, 0, 0
     end
 
-    if not st.popped then
-      -- blowout paths (both deterministic; deflation happens here, not in the
-      -- physics hook, to keep that hook free of engine calls)
-      if st.wear >= 1 then
-        popTire(st, "worn out")
-      elseif st.heatDamage >= 1 then
-        popTire(st, "overheated")
-      end
+    -- The one and only blowout path: the tread is gone. Deflation happens here, not in
+    -- the physics hook, to keep that hook free of engine calls.
+    if not st.popped and st.wear >= 1 then
+      popTire(st, string.format("tread gone (%.1fmm)", treadDepth(1)))
     end
 
     local g = s.gripMin
@@ -355,27 +453,72 @@ local function updateGFX(dt)
     if abs(g - st.lastGrip) > s.gripApplyEpsilon then applyGrip(st, g) end
 
     if not st.popped then
-      -- staged driver warnings
+      -- staged driver warnings, in tread-depth terms
       local stages = s.wearWarnStages
       while st.wearWarn < #stages and st.wear >= stages[st.wearWarn + 1] do
         st.wearWarn = st.wearWarn + 1
-        warn(st, string.format("%s tire at %d%% wear", tostring(st.name), floor(st.wear * 100 + 0.5)), "wear")
+        warn(st, string.format("%s tire tread %s: %.1fmm", tostring(st.name),
+          st.wearWarn >= 2 and "LOW" or "half worn", treadDepth(st.wear)), "wear")
       end
-      local hstages = s.heatWarnStages
-      while st.heatWarn < #hstages and st.heatDamage >= hstages[st.heatWarn + 1] do
-        st.heatWarn = st.heatWarn + 1
-        warn(st, string.format("%s tire overheating: %d C", tostring(st.name), floor(st.treadTemp + 0.5)), "heat")
+      -- Overheat advisory only -- heat no longer bursts anything, it just accelerates
+      -- tread loss (up to wearMultHot x). Hysteresis on the way back down.
+      if not st.overheatWarned then
+        if st.treadTemp >= s.overheatWarnTemp then
+          st.overheatWarned = true
+          warn(st, string.format("%s tire overheating (%d C) -- wearing fast",
+            tostring(st.name), floor(st.treadTemp + 0.5)), "heat")
+        end
+      elseif st.treadTemp <= s.overheatClearTemp then
+        st.overheatWarned = false
       end
     end
   end
 
-  -- UI stream, throttled and gated: costs nothing while the app is closed
-  uiTimer = uiTimer + (dt or 0)
+  -- Calibration telemetry. One compact line per wheel every debugInterval seconds,
+  -- carrying both the raw wd.slipEnergy and the scaled value, so the real magnitude of
+  -- slipEnergy on the test machine can simply be read off the console and pasted back.
+  if s.debug and n > 0 then
+    debugTimer = debugTimer + dt
+    if debugTimer >= s.debugInterval then
+      debugTimer = 0
+      if log then
+        for i = 1, n do
+          local st = activeList[i]
+          log("I", "alexTireWear", string.format(
+            "dbg %-6s slipRaw=%10.1f slipScaled=%10.1f tread=%6.1fC core=%6.1fC wear=%5.1f%% depth=%4.2fmm grip=%5.3f%s",
+            tostring(st.name), st.slipRaw, st.slipPower, st.treadTemp, st.coreTemp,
+            st.wear * 100, treadDepth(st.wear), st.grip,
+            st.popped and " POPPED" or ""))
+        end
+      end
+    end
+  end
+
+  -- UI stream, throttled to ~10 Hz.
+  --
+  -- Transport is exactly what vanilla's own custom-stream extension does
+  -- (vehicle/extensions/advancedwheeldebug.lua:94-95): the only gate is
+  -- playerInfo.firstPlayerSeated, then a bare gui.send. That handles multi-vehicle
+  -- correctness -- every vehicle in the world (traffic included) runs this extension,
+  -- and only the one the player sits in sends. gui.send is guihooks.queueStream, which
+  -- itself no-ops unless guihooks.updateStreams is set (vehicle/main.lua:110-114 sets
+  -- that from streams.hasActiveStreams() and obj:getUpdateUIflag()), so an idle or
+  -- closed UI already costs us nothing.
+  --
+  -- Deliberately NOT gated on streams.willSend(): that additionally requires
+  -- streamControl[name], which is filled only when C++ pushes the UI's requested-stream
+  -- list into this vehicle VM (streams.setRequiredStreams has no Lua caller anywhere in
+  -- the tree). Any vehicle that never receives that push would go permanently silent,
+  -- which is not a failure mode worth the microseconds it saves. Vanilla's own
+  -- custom-stream extension does not use it either.
+  uiTimer = uiTimer + dt
   if uiTimer < s.uiUpdateInterval then return end
   uiTimer = 0
-  if not (streams and streams.willSend and streams.willSend(s.streamName)) then return end
+  if playerInfo and not playerInfo.firstPlayerSeated then return end
   if not (gui and gui.send) then return end
 
+  -- Sent even when n == 0, so the app can tell "extension is running, this vehicle has
+  -- no tires we track" apart from "nothing is sending at all".
   local out = streamCache.wheels
   for i = 1, n do
     local st = activeList[i]
@@ -383,21 +526,42 @@ local function updateGFX(dt)
     if not e then e = {}; out[i] = e end
     e.name = st.name
     e.wear = st.wear
+    e.treadDepth = treadDepth(st.wear)
     e.treadTemp = st.treadTemp
     e.coreTemp = st.coreTemp
-    e.heatDamage = st.heatDamage
     e.grip = st.grip
     e.popped = st.popped
+    e.slipPower = st.slipPower   -- debug only; the app does not render it
+    e.slipRaw = st.slipRaw       -- debug only
   end
   for i = #out, n + 1, -1 do out[i] = nil end
+  streamCache.count = n
+  streamCache.treadNew = s.treadDepthNew
+  streamCache.treadDead = s.treadDepthDead
   gui.send(s.streamName, streamCache)
 end
 
+-- extensions.hook (common/extensions.lua hookFast, :803) does NOT pcall its callees, and
+-- updateGFX is dispatched from vehicle/main.lua:100 -- i.e. before guihooks.sendStreams()
+-- and before hydros/powertrain/sounds/props update. An unhandled error here would
+-- therefore take out every UI stream and half the vehicle's graphics-step work, every
+-- frame, and would also leave hookFast's lazily-built function cache half-populated.
+-- Contain it and shout once instead.
+local function updateGFX(dt)
+  local ok, err = pcall(updateGFXInner, dt)
+  if not ok and not gfxErrorLogged then
+    gfxErrorLogged = true
+    if log then
+      log("E", "alexTireWear", "updateGFX failed (further errors suppressed): " .. tostring(err))
+    end
+  end
+end
+
 local function onTireDeflated(wheelid)
-  -- vanilla is inconsistent about passing cid vs wheelID here, so match either
+  -- vanilla is inconsistent about passing cid vs wheelID here, so match any of them
   for i = 1, #activeList do
     local st = activeList[i]
-    if st.cid == wheelid or st.wheelID == wheelid then
+    if st.dataCid == wheelid or st.cid == wheelid or st.wheelID == wheelid then
       st.popped = true
       return
     end
@@ -406,33 +570,25 @@ end
 
 -- M.onInit is deliberately absent: it never fires for a vehicle auto/ extension
 -- (the hook is dispatched before auto/ loads, and the other path is GE-VM only).
-M.onExtensionLoaded = function() initState(false) end
-M.onVehicleLoaded = function() initState(false) end
-M.onReset = function() initState(true) end
+M.onExtensionLoaded = initState
+M.onVehicleLoaded = initState
+M.onReset = initState
 M.onPhysicsStep = onPhysicsStep
 M.updateGFX = updateGFX
 M.onTireDeflated = onTireDeflated
 
--- Explicit, or the engine would serialize (and tableMerge back) the whole M table.
-M.onSerialize = function()
-  local out = {}
-  for name, st in pairs(wheelStates) do
-    out[name] = {
-      wear = st.wear, treadTemp = st.treadTemp, coreTemp = st.coreTemp,
-      heatDamage = st.heatDamage, popped = st.popped,
-      wearWarn = st.wearWarn, heatWarn = st.heatWarn,
-    }
-  end
-  return {wheels = out}
-end
+-- Tires are always brand new: nothing is carried across a VM reload. onSerialize still
+-- has to exist and return a table, because with neither onSerialize nor M.state defined
+-- the engine serializes the ENTIRE M table and tableMerges it back (common/extensions.lua
+-- getSerializationData / deserialize). onDeserialize exists for the same reason -- to stop
+-- the tableMerge fallback -- and deliberately does nothing.
+M.onSerialize = function() return {} end
+M.onDeserialize = function() end
 
-M.onDeserialize = function(data)
-  if type(data) ~= "table" or type(data.wheels) ~= "table" then return end
-  pendingRestore = data.wheels
-  if #activeList > 0 then applyRestore() end
-end
-
--- console helper: dump(alexTireWear.getDebugState())
+-- console helpers:
+--   dump(alexTireWear.getDebugState())
+--   alexTireWear.settings.debug = true
+--   alexTireWear.settings.slipEnergyScale = 0.1
 M.getDebugState = function() return activeList end
 M.settings = settings
 

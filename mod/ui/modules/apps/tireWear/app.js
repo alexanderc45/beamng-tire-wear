@@ -1,10 +1,12 @@
 // Realistic Tire Wear -- UI app.
 // AngularJS 1.5.8 directive (the only mod-accessible UI framework in 0.38).
-// Data arrives on the "alexTireWear" stream pushed by the vehicle extension.
-angular.module("beamng.apps").directive("alexTireWear", [function () {
+// Data arrives on the "alexTireWear" stream pushed by the vehicle extension. The
+// primary per-tire number is remaining tread depth in mm; the fill bar is wear %.
+angular.module("beamng.apps").directive("alexTireWear", ["$timeout", function ($timeout) {
   "use strict";
 
   var STREAM = "alexTireWear";
+  var WAIT_MS = 3000;   // how long "waiting for tire data" stays before we call it dead
 
   // Markup + styles live here: BeamNG's app loader only reads app.json / app.js,
   // there is no app.html, so the template is a string.
@@ -21,11 +23,12 @@ angular.module("beamng.apps").directive("alexTireWear", [function () {
     ".atw-row{display:flex;justify-content:space-between;align-items:baseline}",
     ".atw-name{font-size:10px;letter-spacing:0.5px;opacity:0.8}",
     ".atw-temp{font-size:11px;font-weight:600}",
-    ".atw-wear{position:absolute;left:4px;bottom:1px;font-size:17px;font-weight:600;line-height:1}",
+    ".atw-depth{position:absolute;left:4px;bottom:1px;font-size:17px;font-weight:600;line-height:1}",
+    ".atw-unit{font-size:9px;font-weight:400;opacity:0.7;margin-left:1px}",
     ".atw-blown .atw-inner{border-color:rgba(255,90,90,0.8)}",
-    ".atw-blown .atw-wear{color:#ff5a5a;font-size:13px}",
+    ".atw-blown .atw-depth{color:#ff5a5a;font-size:13px}",
     ".atw-msg{position:absolute;top:0;left:0;right:0;bottom:0;display:flex;align-items:center;",
-    "justify-content:center;font-size:11px;opacity:0.55}"
+    "justify-content:center;text-align:center;padding:0 6px;font-size:11px;opacity:0.55}"
   ].join("");
 
   var TEMPLATE = [
@@ -79,6 +82,26 @@ angular.module("beamng.apps").directive("alexTireWear", [function () {
       var msg = root.querySelector(".atw-msg");
       var tiles = [];
 
+      // Two-stage placeholder, so "nothing is arriving" is distinguishable from
+      // "it has not arrived yet" without digging through the console.
+      var everReceived = false;   // has ANY payload ever arrived, on any vehicle?
+      var waitTimer = null;
+
+      function setMsg(text) {
+        msg.textContent = text;
+        msg.style.display = text ? "flex" : "none";
+      }
+
+      function armWait() {
+        if (waitTimer) { $timeout.cancel(waitTimer); }
+        setMsg("waiting for tire data");
+        waitTimer = $timeout(function () {
+          waitTimer = null;
+          setMsg(everReceived ? "no tire data for this vehicle"
+                              : "no data — is the mod loaded?");
+        }, WAIT_MS);
+      }
+
       function buildTiles(count) {
         grid.innerHTML = "";
         tiles = [];
@@ -93,7 +116,7 @@ angular.module("beamng.apps").directive("alexTireWear", [function () {
               '<div class="atw-fill"></div>' +
               '<div class="atw-body">' +
                 '<div class="atw-row"><span class="atw-name"></span><span class="atw-temp"></span></div>' +
-                '<div class="atw-wear"></div>' +
+                '<div class="atw-depth"></div>' +
               "</div>" +
             "</div>";
           grid.appendChild(tile);
@@ -102,20 +125,34 @@ angular.module("beamng.apps").directive("alexTireWear", [function () {
             fill: tile.querySelector(".atw-fill"),
             name: tile.querySelector(".atw-name"),
             temp: tile.querySelector(".atw-temp"),
-            wear: tile.querySelector(".atw-wear")
+            depth: tile.querySelector(".atw-depth")
           });
         }
       }
 
-      function render(list) {
+      function reset() {
+        buildTiles(0);
+        armWait();
+      }
+
+      function render(list, treadNew) {
         if (list.length !== tiles.length) { buildTiles(list.length); }
-        msg.style.display = list.length ? "none" : "flex";
+        if (!list.length) {
+          // The extension is alive but tracks no tires on this vehicle.
+          if (waitTimer) { $timeout.cancel(waitTimer); waitTimer = null; }
+          setMsg("no tires tracked on this vehicle");
+          return;
+        }
+        if (waitTimer) { $timeout.cancel(waitTimer); waitTimer = null; }
+        setMsg("");
 
         for (var i = 0; i < list.length; i++) {
           var d = list[i] || {};
           var t = tiles[i];
           var wear = typeof d.wear === "number" ? Math.max(0, Math.min(1, d.wear)) : 0;
           var temp = typeof d.treadTemp === "number" ? d.treadTemp : 0;
+          // fall back to deriving depth from wear if an older extension omits it
+          var depth = typeof d.treadDepth === "number" ? d.treadDepth : (1 - wear) * treadNew;
 
           t.name.textContent = d.name === undefined ? "?" : String(d.name);
           t.temp.textContent = Math.round(temp) + "°C";
@@ -125,12 +162,12 @@ angular.module("beamng.apps").directive("alexTireWear", [function () {
 
           if (d.popped) {
             t.root.className = "atw-tile atw-blown";
-            t.wear.textContent = "BLOWN";
-            t.wear.style.color = "#ff5a5a";
+            t.depth.textContent = "BLOWN";
+            t.depth.style.color = "#ff5a5a";
           } else {
             t.root.className = "atw-tile";
-            t.wear.textContent = Math.round(wear * 100) + "%";
-            t.wear.style.color = wear >= 0.9 ? wearColor(wear) : "#fff";
+            t.depth.innerHTML = depth.toFixed(1) + '<span class="atw-unit">mm</span>';
+            t.depth.style.color = wear >= 0.75 ? wearColor(wear) : "#fff";
           }
         }
       }
@@ -138,10 +175,22 @@ angular.module("beamng.apps").directive("alexTireWear", [function () {
       scope.$on("streamsUpdate", function (event, streams) {
         var data = streams && streams[STREAM];
         if (!data) { return; }
+        everReceived = true;
         var list = data.wheels;
         // an empty Lua table serialises to {} rather than [], so normalise
-        render(Object.prototype.toString.call(list) === "[object Array]" ? list : []);
+        if (Object.prototype.toString.call(list) !== "[object Array]") { list = []; }
+        render(list, typeof data.treadNew === "number" ? data.treadNew : 8);
       });
+
+      // Vanilla apps re-arm on these (see the shipped AdvancedWheelDebug app), and it
+      // keeps a stale readout from a previous car on screen after a switch.
+      scope.$on("VehicleChange", reset);
+      scope.$on("VehicleReset", reset);
+      scope.$on("$destroy", function () {
+        if (waitTimer) { $timeout.cancel(waitTimer); waitTimer = null; }
+      });
+
+      armWait();
     }
   };
 }]);

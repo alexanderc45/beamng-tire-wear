@@ -17,7 +17,9 @@ research.md disagree on API details, research.md wins.
 - Integration at physics rate via `onPhysicsStep` (call `enablePhysicsStepHook()`
   in init). Cheap math only in that hook; UI/messages/actuator updates at
   `updateGFX` rate.
-- Explicit `onSerialize`/`onDeserialize` carrying only the per-wheel state table.
+- No wear persistence anywhere: tires are brand new on every spawn and reset
+  (user decision, 2026-07-29). `onSerialize` stays minimal/explicit only so the
+  engine doesn't serialize the whole module table.
 
 ## Per-wheel state
 
@@ -25,10 +27,9 @@ Keyed by wheel cid, initialized to environment temperature:
 
 | field | meaning |
 |---|---|
-| `wear` | 0 fresh → 1 dead (percentage of usable tread life) |
+| `wear` | 0 fresh → 1 dead; presented as **tread depth** in mm, `treadDepthNew` (8.0) → `treadDepthDead` (1.6, cords) |
 | `treadTemp` | tread surface temp, °C |
 | `coreTemp` | carcass/core temp, °C |
-| `heatDamage` | accumulated overheat damage 0 → 1 (separate blowout path) |
 | `popped` | latch so we deflate exactly once |
 
 ## Model (per physics step, dt ≈ 0.0005 s)
@@ -58,22 +59,22 @@ Applied per wheel through the actuator recommended in research.md
 (`setFrictionThermalSensitivity`), recomputed at updateGFX rate only when the
 multiplier moved meaningfully (avoid hammering the setter every frame).
 
-**Blowouts.** Two deterministic paths, both ending in
-`beamstate.deflateTire(cid)` + a "tire blowout!" message:
-
-1. Wear-out: `wear >= 1.0`.
-2. Heat: while `treadTemp > 140 °C`, `heatDamage` accumulates (faster the hotter);
-   pops at `heatDamage >= 1.0`. Recovers slowly if cooled before the threshold.
+**Blowout.** Exactly one deterministic path (user decision, 2026-07-29 — there
+is no overheat blowout): when tread depth reaches `treadDepthDead`
+(`wear >= 1.0`), `beamstate.deflateTire(cid)` + a "tire blowout!" message.
+Overheating punishes the driver only by accelerating tread loss
+(`tempWearMult`) and softening grip — it never pops a tire directly.
 
 ## Driver feedback
 
 - `guihooks.message(msg, ttl, category, icon)` warnings, one-shot per stage per
-  tire: 50 % / 75 % / 90 % wear, overheat warning, blowout. Category namespaced
+  tire, phrased in tread terms ("FR tread low: 2.4mm") at 50 % / 75 % / 90 %
+  wear, an overheat warning ("wearing fast"), and blowout. Category namespaced
   per wheel so messages don't stomp each other.
 - Simple UI app (`mod/ui/modules/apps/tireWear/`, AngularJS per research.md):
-  four tire tiles showing wear % and tread temp, color-coded (blue cold → green
-  optimal → red overheat; tile fill for wear). Streams data from the extension
-  via `guihooks.trigger` at updateGFX rate.
+  per-tire tiles showing **tread depth in mm** (primary number) and tread temp,
+  color-coded (blue cold → green optimal → red overheat; tile fill for wear).
+  Data ships over the custom "alexTireWear" stream (verified working in-game).
 
 ## Tuning
 
@@ -85,6 +86,6 @@ normal road driving takes much longer.
 
 ## v1 non-goals
 
-Per-compound differences, flatspots, punctures from debris, wear persistence
-across sessions (career `partCondition` integration), and pressure loss before
-the pop. Candidates for v2.
+Per-compound differences, flatspots, punctures from debris, and pressure loss
+before the pop. Candidates for v2. Wear persistence is explicitly rejected, not
+deferred — tires are always fresh on spawn/reset.

@@ -1203,3 +1203,156 @@ Carry these into implementation as things to check on the Windows/Linux test mac
 8. **Multiplayer / AI correctness is unsolved by anyone.** Every existing mod is client-side
    and silently leaves AI vehicles at friction 1.0. If BeamMP or AI parity matters, treat it
    as unexplored design space, not a solved problem.
+
+---
+
+## 9. UI transport and wheel-table addendum (2026-07-29)
+
+Written after the first in-game test. Everything here was read out of the same ~0.36
+mirror used above, plus the shipped UI folder (`SchankIND/ui`), and cross-checked against
+the field reports.
+
+### 9.1 The streams transport works — but `willSend` is the wrong gate for a mod
+
+`gui` is just `guihooks` (`vehicle/main.lua:255`, `gui = guihooks -- backward
+compatibility`), and `gui.send` is `guihooks.queueStream` (`common/guihooks.lua:166`,
+`M.send = queueStream`). `queueStream` already self-gates:
+
+```lua
+-- common/guihooks.lua:96
+local function queueStream(key, value)
+  if M.updateStreams then
+    cache[key] = value
+  end
+end
+```
+
+`M.updateStreams` is set once per graphics step, in `onGraphicsStep`, from
+`streams.hasActiveStreams() and obj:getUpdateUIflag()` (`vehicle/main.lua:110-114`). So a
+bare `gui.send` from a vehicle extension already costs nothing while the UI is not taking
+updates from this vehicle — **there is no need for a second gate.**
+
+`streams.willSend(name)` is a *stricter* gate: it also requires `streamControl[name]`
+(`vehicle/guistreams.lua:16-18`), and `streamControl` is populated only by
+`setRequiredStreams` (`:92`) — which, confirmed again by `gh api search/code`, **has no
+caller anywhere in the shipped Lua tree** in any of the three mirrors. It is invoked from
+C++ with whatever the UI's `StreamsManager` asked for. That is fine for vanilla, but it
+means any vehicle VM that does not receive that push goes permanently silent with no
+diagnostic. §4.7 previously presented the gated form as "correct"; that is now downgraded.
+
+**The confirmed shipped pattern for a mod-defined stream name** is
+`vehicle/extensions/advancedwheeldebug.lua` — a stock extension with a stock UI app
+(`ui/modules/apps/AdvancedWheelDebug/`) on a custom stream name:
+
+```lua
+-- vehicle/extensions/advancedwheeldebug.lua:94-95
+if not playerInfo.firstPlayerSeated then return end
+gui.send('advancedWheelDebugData', data)
+```
+
+No `willSend`. `playerInfo.firstPlayerSeated` is the multi-vehicle filter, and that is
+how vanilla solves it: every vehicle in the world runs the extension, only the one the
+player is sitting in sends. `playerInfo` is a plain global, initialised at
+`vehicle/main.lua:43`, so it is always safe to read.
+
+Its app.js is also the reference for two other things: it re-arms on `VehicleChange` and
+`VehicleReset` (`$scope.$on('VehicleChange', register)`), and it pairs
+`"domElement": "<advanced-wheels-debug></advanced-wheels-debug>"` with
+`"directive": "advancedWheelsDebug"` — confirming plain AngularJS kebab↔camel
+normalisation, i.e. `<alex-tire-wear>` ↔ `alexTireWear` is right. The loader
+(`ge/extensions/ui/apps.lua:12-44`) hard-requires only `domElement` + `directive` (+
+`appName`, defaulted from `directive`), exactly as §4.7 said.
+
+### 9.2 Correction to §2.2: `wheels.wheels` is NOT cid-keyed
+
+§2.2 claimed `wheels.wheels` and `wheels.wheelRotators` are the same tables keyed by
+`cid`. That is true only between `wheels.init()` and `wheels.initSecondStage()`, both of
+which run inside `initSystems()` before `auto/` extensions load. `initSecondStage`
+rebuilds it:
+
+```lua
+-- vehicle/wheels.lua:1082-1106 (abridged)
+M.wheels = {}
+M.wheelCount = 0
+for _, rotator in pairs(M.wheelRotators) do
+  if rotator.rotatorType == "wheel" then
+    M.wheels[M.wheelCount] = rotator      -- SEQUENTIAL key, not rotator.cid
+    M.wheelCount = M.wheelCount + 1
+  elseif rotator.rotatorType == "rotator" then
+    M.rotators[M.rotatorCount] = rotator
+  end
+end
+```
+
+So by the time an `auto/` extension sees it, `wheels.wheels` is keyed `0 .. wheelCount-1`
+and contains only `rotatorType == "wheel"` entries, while `wheels.wheelRotators` is still
+keyed by `wd.cid` and contains everything. Consequences:
+
+- There are **three** ids per wheel, and they coincide only on simple vehicles: the table
+  key, `wd.cid` (the key into `v.data.wheels`, which is what `beamstate.deflateTire`
+  expects — vanilla passes `wd.cid` at `vehicle/wheels.lua:341`), and `wd.wheelID` (what
+  `obj:getWheel` expects, `vehicle/wheels.lua:915`).
+- `wheels.wheels` can legitimately be **empty** while the vehicle has tires. It is also
+  the table every existing tire mod iterates, so this is a plausible shared failure mode
+  for "mod does nothing on vehicle X". Falling back to `wheels.wheelRotators` when
+  `wheels.wheels` yields no candidates is cheap insurance.
+
+### 9.3 An unhandled error in `updateGFX` is expensive, and worth pcall-ing
+
+`extensions.hook` is `hookFast` (`common/extensions.lua:803`) and does **not** pcall its
+callees. `extensions.hook("updateGFX", dtSim)` runs at `vehicle/main.lua:100`, i.e.
+*before* `hydros`, `powertrain`, `energyStorage`, `drivetrain`, `beamstate`, `sounds`,
+`props`, `fire` — and before `guihooks.sendStreams()` at `:112`. An error thrown from a
+mod's `updateGFX` therefore kills every UI stream and half the vehicle's graphics-step
+work, every frame. Worse, `hookFast` builds its per-hook function cache lazily *while
+calling* the functions, so an error during the very first dispatch leaves
+`luaExtensionFuncs["updateGFX"]` half-populated and silently drops every extension
+ordered after the offender. Wrapping the mod's own `updateGFX` body in a `pcall` and
+logging once is strictly better behaviour than the engine's default.
+
+### 9.4 Blowout design, after field testing
+
+The two-path design of §6.4 was tested and the overheat path (path B) has been **removed
+entirely**, at the user's direction. As shipped it was an instant-kill switch: with real
+`slipEnergy` magnitudes the tread temperature pinned at the `maxTemp` clamp, and the
+integrator's rate `(maxTemp - heatDamageTemp) / heatDamageDegreeSeconds` then burst the
+tire within a few seconds of the first overheat warning. Two lessons generalise:
+
+1. **Never let a clamp value feed a damage integrator.** Either saturate the driving
+   quantity well below the clamp, or do not integrate temperature at all.
+2. **An unknown-magnitude input needs a rate cap, not just a scale factor.** `slipEnergy`
+   units are still unverified (§8 item 1), so the wear integrator now carries
+   `maxWearPerSecond`, which puts a hard floor on how fast a new tire can possibly reach
+   the wear-out point regardless of how large `slipEnergy` turns out to be. A single
+   `slipEnergyScale` cannot do that, because it cannot bound the worst case.
+
+Temperature is retained as a *modifier only* — it multiplies wear rate (`tempWearMult`,
+up to 3.5×) and scales grip (`gripFromTemp`) — so overheating still costs the driver
+tread, which is the punishment channel that does not need a separate failure mode.
+
+## 10. BeamNG v0.39 compatibility check (2026-07-29)
+
+Game updated to **v0.39** (first update in ~8 months; Vue UI overhaul, new graphics,
+inter-vehicle aero, Cherrier Ardente, NGRC Rally Utah). Point-by-point verdict from
+the release notes + day-one forum evidence:
+
+- **All physics-side dependencies unchanged**: vehicle auto-extensions + callback set,
+  `wheels.wheels` fields, `beamstate.deflateTire`, `guihooks.message`. Lua API changes
+  in 0.39 are purely additive. No native tire thermals/wear shipped (only additive
+  `conicityFactor` on pressureWheels).
+- **AngularJS HUD apps confirmed still working** (day-one forum stack trace shows a mod
+  app loading through `ui/lib/ext/angular/angular.js`; release notes: "Legacy Angular
+  screens remain supported through an Angular host"). "UI Apps" renamed **HUD Apps**;
+  the update reset many users' layouts — "app disappeared" reports are usually that.
+- **`guihooks.trigger` scoping change**: now reaches only the main UI, not in-vehicle
+  HTML textures. Irrelevant to us (streams path = `obj:queueStreamDataJS` → main UI).
+- **Vue mod apps are now officially possible** (runtime SFC compilation; see
+  `ui/ui-vue/mods/README.md` + `AnnasToolbox` example inside the game install — not
+  online). Hedge for 0.40+, not needed now.
+- **Translations layout changed** (folder-per-language `locales/translations/en-US/…`
+  replacing flat `locales/en-US.json`) — §4.8 is stale; we ship no locales, so no action.
+- **Instability handling changed**: an unstable vehicle is now silently REMOVED instead
+  of pausing physics. Enable "Pause game on instability" while calibrating the grip
+  actuator.
+- Unverified on 0.39 (no public Lua dump yet): `setFrictionThermalSensitivity` /
+  `obj:getWheel` — no changelog mention, assumed present; the extension pcall-guards it.

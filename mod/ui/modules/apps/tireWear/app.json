@@ -2,7 +2,7 @@
   "domElement": "<alex-tire-wear></alex-tire-wear>",
   "directive": "alexTireWear",
   "name": "Realistic Tire Wear",
-  "description": "Per-tire wear percentage and tread temperature.",
+  "description": "Per-tire remaining tread depth (mm) and tread temperature.",
   "author": "alex",
   "version": "1.0",
   "types": [
