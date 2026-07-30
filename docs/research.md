@@ -1578,3 +1578,116 @@ consequences for a mod app:
 So a plain-DOM tuning panel should be built from `input[type=range]` and `button` only.
 (Do `blur()` the slider after a drag, though: a focused range input consumes arrow keys,
 which otherwise also reach the vehicle.)
+
+---
+
+## 13. Particle geometry: emitting sparks in a chosen direction (2026-07-29)
+
+Follow-up to §11, after the first spark implementation read as an upward fountain rather
+than a grinder trailing behind the tire. §11's conclusion ("emit with
+`addParticleByNodesRelative` + type 1") is still right about the *particle type* but wrong
+about the *primitive*: that call cannot express an arbitrary direction.
+
+### 13.1 The primitive set is exactly four, and only one takes vectors
+
+Confirmed against the `obj` runtime dump
+([`Feche/beam_dsx` `dumps/obj_dump.txt`](https://github.com/Feche/beam_dsx/blob/main/dumps/obj_dump.txt)),
+which lists precisely:
+
+```
+addParticle
+addParticleByNodes
+addParticleByNodesRelative
+addParticleVelWidthTypeCount
+```
+
+`gh api search/code` finds **no** vanilla or third-party caller of `addParticle` (only the
+auto-generated `beamng-lua-stubs` placeholder), so its signature is unknowable. The other
+three:
+
+| Call | Direction control | Callers |
+| --- | --- | --- |
+| `addParticleByNodes(cid1, cid2, vel, type, width, count)` | scalar speed along the cid2→cid1 **node axis** | `fire.lua:457`, `controller/jato.lua:58` |
+| `addParticleByNodesRelative(...)` same shape | same, plus the node's own motion | fire, brake smoke, NOS, coolant, beam-break debris |
+| **`addParticleVelWidthTypeCount(nodeId, normal, nodeVel, veloMult, width, type, count)`** | **explicit `normal` and velocity vec3s** | `vehicle/particlefilter.lua:36` |
+
+**The node-pair calls are geometrically incapable of what we want.** They only accept a
+scalar magnitude along the axis between two nodes, and the axes a wheel actually offers
+are wrong: `wd.node1`/`wd.node2` are the **axle**, i.e. lateral, and contact-node→hub is
+vertical. There is no "horizontal, along the rolling direction" node pair on a wheel, so
+that family can only ever spray sideways or up — which is exactly the fountain artefact.
+
+### 13.2 `addParticleVelWidthTypeCount` is the correct primitive, and it is the one vanilla sparks already use
+
+It is the call inside the engine's own friction-particle dispatcher — the code path that
+produces METAL-on-ASPHALT sparks in the first place:
+
+```lua
+-- vehicle/particlefilter.lua:24-40
+local function nodeCollision(p)
+  if p.perpendicularVel > p.depth * depthCoef then
+    local mmap = materialsMap[p.materialID1 * 10000 + p.materialID2]
+    if mmap ~= nil then
+      for _, r in pairs(mmap) do
+        if r.compareFunc(p) then
+          obj:addParticleVelWidthTypeCount(p.id1, p.normal, p.nodeVel, r.veloMult, r.width, r.particleType, r.count)
+        end
+      end
+    end
+  end
+end
+```
+
+`p.normal` is the contact normal and `p.nodeVel` the node's velocity, both vec3
+(`particlefilter.lua:10-22`). So: **node id for the emission position, plus two vectors.**
+
+`veloMult` is corroborated by the two families of rows in `common/particles.json`:
+friction rows (gated on `slipVel`) use `veloMult 1`, i.e. the particle inherits the
+sliding node's velocity; impact rows (gated on `perpendicularVel`, `:130-136`) use
+`veloMult 0` with `width 1.0`, i.e. the particle ignores node velocity and sprays along
+the normal. Sparks are in the first family — `veloMult 1` — so passing our own velocity
+vector with `veloMult = 1` gets it used as-is.
+
+`width` remains the one genuinely unverified parameter. The function name spells it out
+(`...Vel Width Type Count`), and vanilla passes `0.1` for friction particles, `1.0` for
+impact ones, `0.5` for fire's spark spray and `0.01` for the jato jet — so 0.01–0.30 is
+safely inside the range the engine expects. Whether it renders as particle size or as
+emission-point scatter is not determinable from the Lua side.
+
+### 13.3 Geometry that reads as grinding, not fountaining
+
+- **Position:** `wd.lastTreadContactNode` (`vehicle/wheels.lua:105`). That node is on the
+  road by definition, which is what puts the sparks at ground level. If it is `nil`, emit
+  nothing — do *not* substitute the hub, which is where the fountain came from. In
+  practice a wheel carrying load has always reported a contact by then.
+- **Direction:** rearward along the ground, i.e. `-sign(wheelSpeed) * vehicleForward`,
+  plus a small vertical fraction (~0.12) so they skitter rather than clip into the
+  surface. Reversing flips it, so sparks trail the correct side of the tire either way.
+- **Basis vectors with no allocation:** `obj:getDirectionVectorXYZ()` and
+  `obj:getDirectionVectorUpXYZ()` return loose scalars rather than a vec3. Both are in the
+  `obj` dump alongside `getVelocityXYZ`, `getNodePositionRelativeXYZ` etc. — there is an
+  `XYZ` scalar variant of essentially every vector getter, and it is the allocation-free
+  way to do vector maths in a hot path.
+- **Reusing the two vec3s:** `vec3` is an FFI struct with a metatype
+  (`common/mathlib.lua:29-49`) whose fields are plain `.x/.y/.z`
+  (see `LuaVec3:setAdd` etc. at `:424-470`), so two cached instances can be overwritten
+  component-wise every emission with zero garbage.
+- **Ground normal** is approximated by the body up vector. The true surface normal needs
+  `mapmgr.surfaceNormalBelow(pos, 0.1)` (as `advancedwheeldebug.lua:44` does), which
+  allocates and costs a query; with `veloMult = 1` the velocity vector dominates the
+  result anyway.
+
+No vanilla prior art exists for rim/cord sparks specifically — the spike strip
+(`wheels.lua:341`) just calls `beamstate.deflateTire` and lets the generic
+friction-particle table handle whatever the deflated tire's nodes then do. The friction
+table itself is the prior art, and this uses the same primitive it does.
+
+### 13.4 A Lua scoping trap worth recording
+
+The first version of this declared the two cached vec3s *below* `initState` in the file.
+Lua resolves upvalues lexically, so `initState` was assigning two **globals** while the
+emitter read two `nil` upvalues that were never filled — silently and permanently taking
+the degraded node-axis path with no error anywhere. Forward-declare cached objects above
+every function that touches them. BeamNG's `detectGlobalWrites()`
+(`vehicle/main.lua:203`) would eventually flag the global write, but the observable
+symptom is just "the effect looks wrong", which is much harder to trace.

@@ -65,13 +65,21 @@ is no overheat blowout): when tread depth reaches `treadDepthDead`
 Overheating punishes the driver only by accelerating tread loss
 (`tempWearMult`) and softening grip — it never pops a tire directly.
 
-**Cord sparks (added 2026-07-30, user request).** Once tread is within
-`sparkTreadWindow` (0.2 mm) of `treadDepthDead`, the contact patch throws spark
-particles (`obj:addParticleByNodesRelative`, particle type 1) while the wheel is
-rolling (≥2 m/s) under load (≥150 N) on a hard surface (asphalt/metal/rock —
-mirrors vanilla's spark material table). Intensity scales with speed via
-particle count and velocity, never call frequency (≤1 emission per wheel per
-frame). One-shot "tire on the cords!" warning at onset. `sparksEnabled` toggle.
+**Cord sparks (added 2026-07-30, user request; geometry reworked same day).**
+Once tread is within `sparkTreadWindow` (0.2 mm) of `treadDepthDead`, the
+contact patch throws spark particles while the wheel is rolling (≥2 m/s) under
+load (≥150 N) on a hard surface (asphalt/metal/rock — mirrors vanilla's spark
+material table). Emission uses `obj:addParticleVelWidthTypeCount` (the same
+primitive the engine's own friction sparks use): origin = the last tread
+contact node (ground level), velocity = rearward along travel following the
+sign of wheelSpeed (reversing sprays forward) + 12 % vertical, magnitude
+speed-scaled. Falls back to node-axis emission (with an honest log warning)
+if the primitive is missing; ≤1 emission call per wheel per frame, zero
+per-frame allocations. One-shot "tire on the cords!" warning at onset.
+Panel-tunable: `sparksEnabled`, `sparkTreadWindow`, `sparkAmount` (0.25–3×),
+`sparkThickness` (0.01–0.30). Known limits: direction uses the vehicle forward
+axis (drifting wheels trail the body axis), and a fully locked wheel doesn't
+spark (gate is wheel speed, not ground speed).
 
 ## Driver feedback
 

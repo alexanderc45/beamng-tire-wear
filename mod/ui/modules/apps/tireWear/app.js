@@ -89,6 +89,8 @@ angular.module("beamng.apps").directive("alexTireWear", ["$timeout", function ($
       '<div class="atw-tr"><button class="atw-btn" data-a="tempAffectsGrip"></button></div>',
       '<div class="atw-tr"><button class="atw-btn" data-a="sparksEnabled"></button></div>',
       row("SPARK WINDOW", "sparkTreadWindow", 0.1, 1, 0.05),
+      row("SPARK AMOUNT", "sparkAmount", 0.25, 3, 0.25),
+      row("SPARK WIDTH", "sparkThickness", 0.01, 0.3, 0.01),
       '<div class="atw-sep"></div>',
       '<button class="atw-btn wide" data-a="reset">RESET TO DEFAULTS</button>',
     "</div>",
@@ -103,9 +105,12 @@ angular.module("beamng.apps").directive("alexTireWear", ["$timeout", function ($
     heatSpeed: 1.0,
     tempAffectsGrip: true,
     sparksEnabled: true,
-    sparkTreadWindow: 0.2
+    sparkTreadWindow: 0.2,
+    sparkAmount: 1.0,
+    sparkThickness: 0.05
   };
-  var TUNING_KEYS = ["treadDepthNew", "wearSpeed", "heatSpeed", "sparkTreadWindow"];
+  var TUNING_KEYS = ["treadDepthNew", "wearSpeed", "heatSpeed", "sparkTreadWindow",
+                     "sparkAmount", "sparkThickness"];
   var TOGGLE_KEYS = ["tempAffectsGrip", "sparksEnabled"];
   // Vanilla apps persist app-local state in localStorage under this exact naming
   // convention -- e.g. 'apps:indicatedAirspeed.unit' in the shipped IndicatedAirspeed
@@ -122,7 +127,9 @@ angular.module("beamng.apps").directive("alexTireWear", ["$timeout", function ($
     treadDepthNew: [1, 30],
     wearSpeed: [0.25, 5],
     heatSpeed: [0.25, 4],
-    sparkTreadWindow: [0.1, 1]
+    sparkTreadWindow: [0.1, 1],
+    sparkAmount: [0.25, 3],
+    sparkThickness: [0.01, 0.30]
   };
 
   function sanitize(raw) {
@@ -239,6 +246,7 @@ angular.module("beamng.apps").directive("alexTireWear", ["$timeout", function ($
         if (key === "tread") { return Math.round(v) + "%"; }
         if (key === "treadDepthNew") { return v.toFixed(1) + "mm"; }
         if (key === "sparkTreadWindow") { return v.toFixed(2) + "mm"; }
+        if (key === "sparkThickness") { return v.toFixed(2); }
         return v.toFixed(2).replace(/0$/, "") + "×";
       }
 

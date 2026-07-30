@@ -113,9 +113,13 @@ local settings = {
   sparkCountBase = 1,           -- particles per emission
   sparkCountPerSpeed = 1 / 12,  -- extra particles per emission per m/s
   sparkCountMax = 4,
-  sparkVelBase = 1.0,           -- particle velocity away from the hub, m/s
-  sparkVelPerSpeed = 0.15,
-  sparkVelMax = 6.0,
+  -- Ejection speed, m/s, directed REARWARD along the ground (see updateSparks).
+  sparkVelBase = 2.0,
+  sparkVelPerSpeed = 0.25,
+  sparkVelMax = 12.0,
+  -- Small vertical component as a fraction of the rearward speed. Keep this low: the
+  -- whole point is that sparks skitter along the road rather than fountain upward.
+  sparkUpFraction = 0.12,
   sparkWidth = 0.05,
   sparkParticleType = 1,        -- 1 == SPARKS (common/particles.json particle table)
   -- Vanilla only defines spark particles for METAL on ASPHALT and METAL on METAL
@@ -149,6 +153,11 @@ local baseline = {
   sparkTreadWindow = settings.sparkTreadWindow,
   tempAffectsGrip = settings.tempAffectsGrip,
   sparksEnabled = settings.sparksEnabled,
+  sparkRateBase = settings.sparkRateBase,
+  sparkRatePerSpeed = settings.sparkRatePerSpeed,
+  sparkCountPerSpeed = settings.sparkCountPerSpeed,
+  sparkCountMax = settings.sparkCountMax,
+  sparkWidth = settings.sparkWidth,
 }
 
 -- The effective user-facing tuning, echoed back on the stream so the app can render
@@ -160,6 +169,8 @@ local tuning = {
   tempAffectsGrip = baseline.tempAffectsGrip,
   sparksEnabled = baseline.sparksEnabled,
   sparkTreadWindow = baseline.sparkTreadWindow,
+  sparkAmount = 1.0,
+  sparkThickness = baseline.sparkWidth,
 }
 -- 0 means "nothing has been pushed to this vehicle yet". The app compares this against
 -- its own stored token and re-pushes on any mismatch, which is what makes tuning
@@ -181,6 +192,14 @@ local actuatorOk = true
 local actuatorChecked = false
 local sparksOk = true
 local sparksChecked = false
+local sparksLegacy = false   -- true once we have fallen back to the node-axis primitive
+-- Reused spark vectors. Declared HERE, above initState, on purpose: declared below it
+-- these would be globals from initState's point of view, so initState would fill in two
+-- globals while the emitter kept reading two nil upvalues -- silently and permanently
+-- taking the degraded emission path. vec3 is an FFI struct with plain .x/.y/.z fields
+-- (common/mathlib.lua:37), so mutating them in place allocates nothing.
+local sparkNormal = nil
+local sparkVel = nil
 local streamCache = {wheels = {}, count = 0, treadNew = 8.0, treadDead = 1.6,
                      tuningToken = 0, tuning = {}}
 local srcTable = nil         -- the wheel table initState built activeList from
@@ -325,6 +344,11 @@ local function initState()
   actuatorChecked = false
   sparksOk = true
   sparksChecked = false
+  sparksLegacy = false
+  -- allocate the reusable spark vectors once, here, so the emission path never does
+  if not sparkNormal and type(vec3) == "function" then
+    sparkNormal, sparkVel = vec3(0, 0, 1), vec3(0, 0, 0)
+  end
   activeList = {}
 
   local wheelsTable, sourceCount, sourceName = pickWheelTable()
@@ -458,12 +482,20 @@ local function applyGrip(st, g)
   end
 end
 
--- module-level so the pcall probe below never allocates a closure
-local function emitSparks(cid1, cid2, vel, ptype, width, count)
-  -- (cid1, cid2, velocity, particleType, width, count). Velocity is along the
-  -- cid2 -> cid1 axis; negative pushes the particles away from cid2, so with
-  -- cid2 = the hub node the spray goes outward, toward the road. Same call vanilla
-  -- uses for brake smoke off the disc (vehicle/wheels.lua:227).
+-- module-level so the pcall probes below never allocate a closure.
+--
+-- The good primitive: an explicit emission node plus explicit normal and velocity
+-- VECTORS. This is what the engine's own friction-particle path uses
+-- (vehicle/particlefilter.lua:36), which is where METAL-on-ASPHALT sparks come from, so
+-- it is exactly the right call for this effect:
+--   obj:addParticleVelWidthTypeCount(nodeId, normal, nodeVel, veloMult, width, type, count)
+local function emitSparksVel(nodeId, normal, vel, veloMult, width, ptype, count)
+  obj:addParticleVelWidthTypeCount(nodeId, normal, vel, veloMult, width, ptype, count)
+end
+
+-- Degraded fallback, only if the above is unavailable: a node-pair axis, which cannot
+-- express "rearward along the ground" and reads as an upward fountain.
+local function emitSparksNodes(cid1, cid2, vel, ptype, width, count)
   obj:addParticleByNodesRelative(cid1, cid2, vel, ptype, width, count)
 end
 
@@ -516,32 +548,65 @@ local function updateSparks(st, wd, dt)
 
   local count = floor(s.sparkCountBase + s.sparkCountPerSpeed * speed)
   if count < 1 then count = 1 elseif count > s.sparkCountMax then count = s.sparkCountMax end
-  local vel = s.sparkVelBase + s.sparkVelPerSpeed * speed
-  if vel > s.sparkVelMax then vel = s.sparkVelMax end
+  local mag = s.sparkVelBase + s.sparkVelPerSpeed * speed
+  if mag > s.sparkVelMax then mag = s.sparkVelMax end
 
-  -- Prefer the actual tread node last in contact -- that is the contact patch
-  -- (vehicle/wheels.lua:105). Fall back to the hub axis if we have not seen one.
-  local hub = wd.node1
-  local cid1 = wd.lastTreadContactNode
-  local cid2 = hub
-  if not cid1 or cid1 == hub then
-    cid1, cid2 = hub, wd.node2
+  -- Emit FROM the contact patch: the tread node last reported in contact
+  -- (vehicle/wheels.lua:105). That node is by definition on the road, which is what puts
+  -- the sparks at ground level instead of at hub height.
+  local nodeId = wd.lastTreadContactNode
+  if not nodeId then return end   -- no contact seen yet; a loaded wheel gets one at once
+
+  if sparkNormal and sparkVel and not sparksLegacy then
+    -- Direction: rearward relative to the tire's surface motion, i.e. opposite the
+    -- direction of travel, following the sign of wheelSpeed so reversing throws them
+    -- forward. Plus a small vertical component. Both basis vectors come back as loose
+    -- scalars (getDirectionVectorXYZ / getDirectionVectorUpXYZ), so nothing allocates.
+    local fx, fy, fz = obj:getDirectionVectorXYZ()
+    local ux, uy, uz = obj:getDirectionVectorUpXYZ()
+    local dir = (wd.wheelSpeed or 0) >= 0 and -mag or mag
+    local up = mag * s.sparkUpFraction
+    sparkVel.x = fx * dir + ux * up
+    sparkVel.y = fy * dir + uy * up
+    sparkVel.z = fz * dir + uz * up
+    -- Ground normal, approximated by the body's up vector. Cheap, and correct on any
+    -- surface flat enough to be sparking on; the true normal would need a raycast
+    -- (mapmgr.surfaceNormalBelow) that allocates and costs more than it is worth here.
+    sparkNormal.x, sparkNormal.y, sparkNormal.z = ux, uy, uz
+
+    if sparksChecked then
+      emitSparksVel(nodeId, sparkNormal, sparkVel, 1, s.sparkWidth, s.sparkParticleType, count)
+      return
+    end
+    -- The argument shape is read off vanilla's own call site rather than a documented
+    -- signature, so prove it once before trusting it every frame.
+    local ok = pcall(emitSparksVel, nodeId, sparkNormal, sparkVel, 1, s.sparkWidth,
+                     s.sparkParticleType, count)
+    if ok then
+      sparksChecked = true
+      return
+    end
+    sparksLegacy = true
+    if log then
+      log("W", "alexTireWear",
+        "addParticleVelWidthTypeCount unavailable; falling back to node-axis sparks (direction will be wrong)")
+    end
   end
-  if not cid1 or not cid2 then return end
 
+  -- Fallback path: node-pair axis only.
+  local cid2 = wd.node1
+  if nodeId == cid2 then cid2 = wd.node2 end
+  if not cid2 then return end
   if sparksChecked then
-    emitSparks(cid1, cid2, -vel, s.sparkParticleType, s.sparkWidth, count)
+    emitSparksNodes(nodeId, cid2, -mag, s.sparkParticleType, s.sparkWidth, count)
     return
   end
-  -- first emission only: the exact argument shape of addParticleByNodesRelative is
-  -- inferred from vanilla call sites, not from a documented signature, so prove it
-  -- before trusting it every frame
-  local ok = pcall(emitSparks, cid1, cid2, -vel, s.sparkParticleType, s.sparkWidth, count)
-  if ok then
+  local ok2 = pcall(emitSparksNodes, nodeId, cid2, -mag, s.sparkParticleType, s.sparkWidth, count)
+  if ok2 then
     sparksChecked = true
   else
     sparksOk = false
-    if log then log("E", "alexTireWear", "addParticleByNodesRelative unavailable; cord sparks disabled") end
+    if log then log("E", "alexTireWear", "no usable particle primitive; cord sparks disabled") end
   end
 end
 
@@ -715,6 +780,8 @@ local function updateGFXInner(dt)
   ut.tempAffectsGrip = tuning.tempAffectsGrip
   ut.sparksEnabled = tuning.sparksEnabled
   ut.sparkTreadWindow = tuning.sparkTreadWindow
+  ut.sparkAmount = tuning.sparkAmount
+  ut.sparkThickness = tuning.sparkThickness
   gui.send(s.streamName, streamCache)
 end
 
@@ -756,6 +823,10 @@ local limits = {
   wearSpeed = {0.25, 5.0},
   heatSpeed = {0.25, 4.0},
   sparkTreadWindow = {0.1, 1.0},
+  sparkAmount = {0.25, 3.0},
+  -- vanilla passes 0.1 for friction particles and 1.0 for impact ones
+  -- (common/particles.json), so this range sits well inside what the engine expects
+  sparkThickness = {0.01, 0.30},
 }
 
 local function applyUserTuning(t)
@@ -766,6 +837,8 @@ local function applyUserTuning(t)
   tuning.wearSpeed = num(t.wearSpeed, limits.wearSpeed[1], limits.wearSpeed[2], tuning.wearSpeed)
   tuning.heatSpeed = num(t.heatSpeed, limits.heatSpeed[1], limits.heatSpeed[2], tuning.heatSpeed)
   tuning.sparkTreadWindow = num(t.sparkTreadWindow, limits.sparkTreadWindow[1], limits.sparkTreadWindow[2], tuning.sparkTreadWindow)
+  tuning.sparkAmount = num(t.sparkAmount, limits.sparkAmount[1], limits.sparkAmount[2], tuning.sparkAmount)
+  tuning.sparkThickness = num(t.sparkThickness, limits.sparkThickness[1], limits.sparkThickness[2], tuning.sparkThickness)
   tuning.tempAffectsGrip = bool(t.tempAffectsGrip, tuning.tempAffectsGrip)
   tuning.sparksEnabled = bool(t.sparksEnabled, tuning.sparksEnabled)
 
@@ -779,6 +852,18 @@ local function applyUserTuning(t)
   s.sparkTreadWindow = tuning.sparkTreadWindow
   s.tempAffectsGrip = tuning.tempAffectsGrip
   s.sparksEnabled = tuning.sparksEnabled
+
+  -- "Spark amount" moves emission rate and per-emission particle count together. Note
+  -- the rate saturates at one emission per wheel per frame by design, so above roughly
+  -- 1.5x it is the count that keeps growing -- which is the intent (denser spray, not
+  -- more calls).
+  local amt = tuning.sparkAmount
+  s.sparkRateBase = baseline.sparkRateBase * amt
+  s.sparkRatePerSpeed = baseline.sparkRatePerSpeed * amt
+  s.sparkCountPerSpeed = baseline.sparkCountPerSpeed * amt
+  s.sparkCountMax = floor(baseline.sparkCountMax * amt + 0.5)
+  if s.sparkCountMax < 1 then s.sparkCountMax = 1 end
+  s.sparkWidth = tuning.sparkThickness
 
   -- treadDepthNew has to stay clear of treadDepthDead or treadDepth() inverts. Push the
   -- *new* depth up rather than pulling the dead depth down: treadDepthDead is not
@@ -839,6 +924,8 @@ local function resetUserTuning()
     tempAffectsGrip = baseline.tempAffectsGrip,
     sparksEnabled = baseline.sparksEnabled,
     sparkTreadWindow = baseline.sparkTreadWindow,
+    sparkAmount = 1.0,
+    sparkThickness = baseline.sparkWidth,
   })
 end
 
