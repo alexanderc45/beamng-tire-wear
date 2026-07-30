@@ -1476,3 +1476,105 @@ end
 The accumulator resets on the frame *after* it fires, so it emits at most once per wheel
 per graphics frame no matter how large the rate term gets. Copy that shape and scale
 visual intensity through `count` and `vel` rather than through call frequency.
+
+---
+
+## 12. UI → Lua bridge and app-local persistence (2026-07-29)
+
+Researched to build the in-app tuning panel. Sources: the shipped UI folder
+(`SchankIND/ui`, i.e. the game's own `/ui` tree) and the ~0.36 Lua mirror.
+
+### 12.1 `bngApi` is a window global, not an injectable
+
+Every shipped app uses it without declaring it in the directive's DI array — e.g.
+`modules/apps/AdvancedWheelDebug/app.js` has `controller: ['$log', '$scope', function
+($log, $scope) {` and then calls `bngApi.activeObjectLua(...)`. Same for `StreamsManager`
+and `UiUnits`. So `bngApi` can just be referenced (guard with `typeof bngApi !==
+"undefined"` for safety).
+
+### 12.2 The four bridges, and which one to use
+
+Implementation in `ui-vue/src/bridge/libs/BeamNGAPI.js`:
+
+| Method | Target | Callback support |
+| --- | --- | --- |
+| `bngApi.engineLua(cmd[, cb])` | GE Lua VM | yes |
+| `bngApi.activeObjectLua(cmd[, cb])` | the **player's current vehicle** VM | yes |
+| `bngApi.queueAllObjectLua(cmd)` | **every** vehicle VM | no |
+| `bngApi.engineScript(cmd[, cb])` | TorqueScript | yes |
+
+Usage counts across the shipped apps: `engineLua` 21 apps, `activeObjectLua` 16,
+`queueAllObjectLua` 2. The callback forms work by wrapping the command in
+`guihooks.trigger("onBNGAPICallback", id, <cmd>)`, so the command must be an *expression*
+when you pass a callback, and may be a statement when you do not.
+
+**`queueAllObjectLua` is directly available and confirmed in an AngularJS app** —
+`modules/apps/Winds/app.js` (an `angular.module('beamng.apps')` directive) does:
+
+```js
+bngApi.queueAllObjectLua('obj:setWind(' + x + ',' + y + ',0)')
+```
+
+That makes "apply to every vehicle including traffic" a one-liner; no
+`engineLua('be:queueAllObjectLua(...)')` indirection needed (though
+`modules/apps/Traffic/app.js:84` shows that longer form works too). Use
+`queueAllObjectLua` for world-wide settings and `activeObjectLua` for anything that is
+about the car the player is driving.
+
+Guard the call for load order, since a vehicle may not have the extension:
+`'if alexTireWear then alexTireWear.applyUserTuning(...) end'`.
+
+### 12.3 `bngApi.serializeToLua(obj)` — JS object → Lua table literal
+
+Public method on the same class. Handles `String` (with escaping, and a deliberate
+non-`JSON.stringify` path because of a non-English-locale Lua parser bug, GE-3042),
+`Number` (returns `null` for non-finite — so filter NaN/Infinity yourself), `Boolean`,
+`Array` → `{...}`, `Function` → `nil`, and plain objects → `{["key"]=value,...}`. Nested
+tables work. This is the correct way to ship a settings table across the bridge.
+
+### 12.4 App-local persistence: `localStorage`, with a naming convention
+
+Two shipped apps persist their own state, and both use `localStorage` directly:
+
+```js
+// modules/apps/IndicatedAirspeed/app.js:13,16
+var Unit = localStorage.getItem('apps:indicatedAirspeed.unit') || 'KNOTS'
+localStorage.setItem('apps:indicatedAirspeed.unit', Unit)
+
+// modules/apps/SimpleTrip/app.js:51
+var mode = parseInt(localStorage.getItem('apps:simpleTrip.mode')) || 0
+```
+
+So the convention is `apps:<camelCaseAppName>.<key>`, and BeamNG ships this as *the*
+mechanism for remembering a user's per-app choice across restarts — an app that forgot
+your unit selection on every launch would be a bug, so CEF's local storage is persistent.
+Wrap access in `try/catch` anyway; a quota or private-mode failure should degrade to
+"tuning does not persist", not break the app.
+
+**Correction to §4.7:** it listed an optional `settings.json` alongside `app.json` /
+`app.js`. There is no such thing — `ge/extensions/ui/apps.lua` never looks for it, and no
+shipped app has one. App-local settings are `localStorage`, or a panel inside the app.
+
+### 12.5 Text inputs need `setCEFTyping`; sliders do not
+
+`lib/int/beamng-core.js` registers global AngularJS **element** directives on `input` and
+`textarea` (`:778-789`) whose link function is `bngLinkInput` (`:797`):
+
+```lua
+elem.on("focus", ...) -> bngApi.engineLua("setCEFTyping(true)", ...)
+elem.on("blur",  ...) -> bngApi.engineLua("setCEFTyping(false)", ...)
+```
+
+Without that, keystrokes typed into a field also reach the vehicle's input bindings. Two
+consequences for a mod app:
+
+1. **The directive only fires on elements Angular compiles.** Markup built with
+   `document.createElement` / `innerHTML` and never `$compile`'d does *not* get it, so a
+   hand-built number field in a HUD app would steer the car while you type in it.
+2. **`input[type=range]` is exempt by that helper's own test** —
+   `isTextInput()` only counts `text`, `number`, `password`, `search` (and any non-`input`
+   tag). Sliders therefore need no `setCEFTyping` handling at all.
+
+So a plain-DOM tuning panel should be built from `input[type=range]` and `button` only.
+(Do `blur()` the slider after a drag, though: a focused range input consumes arrow keys,
+which otherwise also reach the vehicle.)

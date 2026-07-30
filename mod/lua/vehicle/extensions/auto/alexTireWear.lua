@@ -75,6 +75,9 @@ local settings = {
   wearGripAtDead = 0.65,
 
   -- Grip from temperature: plateau in the optimal window, soft shoulders.
+  -- User-facing toggle; when false gripFromTemp is pinned to 1 and only wear responds
+  -- to temperature.
+  tempAffectsGrip = true,
   gripColdTemp = 20.0,
   gripColdMult = 0.85,
   gripTempOptLow = 75.0,
@@ -134,6 +137,35 @@ local settings = {
   reinitInterval = 1.0,     -- seconds between self-heal wheel-list rescans
 }
 
+-- Snapshot of the constants the user-facing multipliers scale, taken before anything
+-- can touch them. applyUserTuning always recomputes from these, so applying tuning
+-- repeatedly is idempotent instead of compounding.
+local baseline = {
+  wearRate = settings.wearRate,
+  maxWearPerSecond = settings.maxWearPerSecond,
+  slipHeatCoef = settings.slipHeatCoef,
+  rollHeatCoef = settings.rollHeatCoef,
+  treadDepthNew = settings.treadDepthNew,
+  sparkTreadWindow = settings.sparkTreadWindow,
+  tempAffectsGrip = settings.tempAffectsGrip,
+  sparksEnabled = settings.sparksEnabled,
+}
+
+-- The effective user-facing tuning, echoed back on the stream so the app can render
+-- what is actually in force (and detect that a freshly spawned vehicle has none).
+local tuning = {
+  treadDepthNew = baseline.treadDepthNew,
+  wearSpeed = 1.0,
+  heatSpeed = 1.0,
+  tempAffectsGrip = baseline.tempAffectsGrip,
+  sparksEnabled = baseline.sparksEnabled,
+  sparkTreadWindow = baseline.sparkTreadWindow,
+}
+-- 0 means "nothing has been pushed to this vehicle yet". The app compares this against
+-- its own stored token and re-pushes on any mismatch, which is what makes tuning
+-- survive vehicle switches, resets and VM reloads.
+local tuningToken = 0
+
 -- ---------------------------------------------------------------------------
 
 local abs, floor = math.abs, math.floor
@@ -149,7 +181,8 @@ local actuatorOk = true
 local actuatorChecked = false
 local sparksOk = true
 local sparksChecked = false
-local streamCache = {wheels = {}, count = 0, treadNew = 8.0, treadDead = 1.6}
+local streamCache = {wheels = {}, count = 0, treadNew = 8.0, treadDead = 1.6,
+                     tuningToken = 0, tuning = {}}
 local srcTable = nil         -- the wheel table initState built activeList from
 local builtWheelCount = -1   -- candidate count of the source table we last built from
 local beaconCount = -1       -- last count we logged, so re-inits only log on change
@@ -194,6 +227,7 @@ end
 
 local function gripFromTemp(t)
   local s = settings
+  if not s.tempAffectsGrip then return 1.0 end
   if t <= s.gripColdTemp then return s.gripColdMult end
   if t < s.gripTempOptLow then
     return s.gripColdMult + (1.0 - s.gripColdMult) * (t - s.gripColdTemp) / (s.gripTempOptLow - s.gripColdTemp)
@@ -671,6 +705,16 @@ local function updateGFXInner(dt)
   streamCache.count = n
   streamCache.treadNew = s.treadDepthNew
   streamCache.treadDead = s.treadDepthDead
+  -- reused sub-table; the app reads these to render the panel and to notice that a
+  -- freshly spawned vehicle has not had this session's tuning pushed to it yet
+  streamCache.tuningToken = tuningToken
+  local ut = streamCache.tuning
+  ut.treadDepthNew = tuning.treadDepthNew
+  ut.wearSpeed = tuning.wearSpeed
+  ut.heatSpeed = tuning.heatSpeed
+  ut.tempAffectsGrip = tuning.tempAffectsGrip
+  ut.sparksEnabled = tuning.sparksEnabled
+  ut.sparkTreadWindow = tuning.sparkTreadWindow
   gui.send(s.streamName, streamCache)
 end
 
@@ -688,6 +732,114 @@ local function updateGFX(dt)
       log("E", "alexTireWear", "updateGFX failed (further errors suppressed): " .. tostring(err))
     end
   end
+end
+
+-- ---------------------------------------------------------------------------
+-- User tuning. Called from the UI app across the JS -> vehicle-Lua bridge, so treat
+-- every field as hostile: wrong type, NaN, out of range, or simply absent.
+-- ---------------------------------------------------------------------------
+local function num(v, lo, hi, fallback)
+  if type(v) ~= "number" or v ~= v then return fallback end
+  if v < lo then return lo elseif v > hi then return hi end
+  return v
+end
+
+local function bool(v, fallback)
+  if type(v) == "boolean" then return v end
+  return fallback
+end
+
+-- Ranges are the authority, not the UI: the sliders are a convenience, and a hand-typed
+-- console call gets clamped identically.
+local limits = {
+  treadDepthNew = {1.0, 30.0},
+  wearSpeed = {0.25, 5.0},
+  heatSpeed = {0.25, 4.0},
+  sparkTreadWindow = {0.1, 1.0},
+}
+
+local function applyUserTuning(t)
+  if type(t) ~= "table" then return false end
+
+  -- Unknown keys are ignored by construction: we only ever read the six we know.
+  tuning.treadDepthNew = num(t.treadDepthNew, limits.treadDepthNew[1], limits.treadDepthNew[2], tuning.treadDepthNew)
+  tuning.wearSpeed = num(t.wearSpeed, limits.wearSpeed[1], limits.wearSpeed[2], tuning.wearSpeed)
+  tuning.heatSpeed = num(t.heatSpeed, limits.heatSpeed[1], limits.heatSpeed[2], tuning.heatSpeed)
+  tuning.sparkTreadWindow = num(t.sparkTreadWindow, limits.sparkTreadWindow[1], limits.sparkTreadWindow[2], tuning.sparkTreadWindow)
+  tuning.tempAffectsGrip = bool(t.tempAffectsGrip, tuning.tempAffectsGrip)
+  tuning.sparksEnabled = bool(t.sparksEnabled, tuning.sparksEnabled)
+
+  local s = settings
+  -- "Wear speed" scales the rate and its safety cap together, so the pacing curve keeps
+  -- its shape (including the hard floor) instead of the cap swallowing the multiplier.
+  s.wearRate = baseline.wearRate * tuning.wearSpeed
+  s.maxWearPerSecond = baseline.maxWearPerSecond * tuning.wearSpeed
+  s.slipHeatCoef = baseline.slipHeatCoef * tuning.heatSpeed
+  s.rollHeatCoef = baseline.rollHeatCoef * tuning.heatSpeed
+  s.sparkTreadWindow = tuning.sparkTreadWindow
+  s.tempAffectsGrip = tuning.tempAffectsGrip
+  s.sparksEnabled = tuning.sparksEnabled
+
+  -- treadDepthNew has to stay clear of treadDepthDead or treadDepth() inverts. Push the
+  -- *new* depth up rather than pulling the dead depth down: treadDepthDead is not
+  -- user-tunable, and mutating it here would be one-way (a later reset restores
+  -- treadDepthNew but would leave treadDepthDead permanently wrong).
+  local floorNew = s.treadDepthDead * 1.25
+  if tuning.treadDepthNew < floorNew then tuning.treadDepthNew = floorNew end
+  s.treadDepthNew = tuning.treadDepthNew
+
+  -- grip curve may have changed shape (tempAffectsGrip), so force one actuator write
+  for i = 1, #activeList do activeList[i].lastGrip = -1 end
+
+  local tok = t.token
+  tuningToken = (type(tok) == "number" and tok == tok) and tok or (tuningToken + 1)
+  return true
+end
+
+-- Set CURRENT tread as a percentage remaining: 100 = new, 0 = down to treadDepthDead.
+local function setTreadPercent(pct)
+  pct = num(pct, 0, 100, nil)
+  if not pct then return false end
+  local w = 1.0 - pct * 0.01
+  if w < 0 then w = 0 elseif w > 1 then w = 1 end
+
+  local s = settings
+  local inSparkWindow = treadDepth(w) <= s.treadDepthDead + s.sparkTreadWindow
+
+  for i = 1, #activeList do
+    local st = activeList[i]
+    -- A burst tire stays burst: there is no un-popping, and beamstate has already
+    -- deflated the pressure group and softened the beams.
+    if not st.popped then
+      st.wear = w
+      -- Re-seat the warning ladder to the highest stage this tread level has already
+      -- passed, so dialling tread down does not replay every message, and dialling it
+      -- back up re-arms them.
+      local stages = s.wearWarnStages
+      local passed = 0
+      for j = 1, #stages do
+        if w >= stages[j] then passed = j end
+      end
+      st.wearWarn = passed
+      -- Deliberately setting bald tires is not worth an alert; crossing into the cords
+      -- while driving is. So suppress the announcement only when it is already true.
+      st.sparkWarned = inSparkWindow
+      st.sparkTick = 0
+      st.lastGrip = -1
+    end
+  end
+  return true
+end
+
+local function resetUserTuning()
+  return applyUserTuning({
+    treadDepthNew = baseline.treadDepthNew,
+    wearSpeed = 1.0,
+    heatSpeed = 1.0,
+    tempAffectsGrip = baseline.tempAffectsGrip,
+    sparksEnabled = baseline.sparksEnabled,
+    sparkTreadWindow = baseline.sparkTreadWindow,
+  })
 end
 
 local function onTireDeflated(wheelid)
@@ -718,8 +870,18 @@ M.onTireDeflated = onTireDeflated
 M.onSerialize = function() return {} end
 M.onDeserialize = function() end
 
+-- User-tuning API. Also the bridge the UI app's tuning panel calls into:
+--   bngApi.queueAllObjectLua('alexTireWear.applyUserTuning({...})')  -- all vehicles
+--   bngApi.activeObjectLua('alexTireWear.setTreadPercent(30)')       -- player only
+M.applyUserTuning = applyUserTuning
+M.setTreadPercent = setTreadPercent
+M.resetUserTuning = resetUserTuning
+M.getUserTuning = function() return tuning, tuningToken end
+
 -- console helpers:
 --   dump(alexTireWear.getDebugState())
+--   dump(alexTireWear.getUserTuning())
+--   alexTireWear.setTreadPercent(30)
 --   alexTireWear.settings.debug = true
 --   alexTireWear.settings.slipEnergyScale = 0.1
 M.getDebugState = function() return activeList end

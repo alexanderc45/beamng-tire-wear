@@ -2,7 +2,7 @@
   "domElement": "<alex-tire-wear></alex-tire-wear>",
   "directive": "alexTireWear",
   "name": "Realistic Tire Wear",
-  "description": "Per-tire remaining tread depth (mm) and tread temperature.",
+  "description": "Per-tire remaining tread depth (mm) and tread temperature, with a built-in tuning panel (gear icon).",
   "author": "alex",
   "version": "1.0",
   "types": [
@@ -14,7 +14,7 @@
     "top": "0px",
     "left": "0px",
     "width": "210px",
-    "height": "150px",
+    "height": "200px",
     "min-width": "150px",
     "min-height": "100px",
     "border-radius": "8px"

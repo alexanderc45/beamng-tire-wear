@@ -84,6 +84,21 @@ frame). One-shot "tire on the cords!" warning at onset. `sparksEnabled` toggle.
   color-coded (blue cold → green optimal → red overheat; tile fill for wear).
   Data ships over the custom "alexTireWear" stream (verified working in-game).
 
+## User tuning panel (added 2026-07-30, user request)
+
+Gear icon in the HUD app opens a slider/toggle panel: current tread % (apply to
+player's tires), new-tire tread depth (4–14 mm), wear speed (0.25–5×, scales
+rate and safety cap together), tire heating (0.25–4×), temp-affects-grip
+toggle, cord sparks toggle + spark window (0.1–1.0 mm), reset to defaults.
+Sliders only — no text inputs (BeamNG's CEF-typing guard doesn't cover plain-DOM
+text fields, so typed digits would reach the car controls). Extension side:
+`applyUserTuning` (validated/clamped, idempotent via baseline snapshot, pushed
+to ALL vehicles via `queueAllObjectLua`) and `setTreadPercent` (player vehicle;
+popped tires stay popped). Persistence: localStorage (`apps:alexTireWear.tuning`,
+the vanilla convention) + a tuning token echoed on the stream; the app re-pushes
+whenever a vehicle's token mismatches (rate-limited 1/s). Known gap: tuning only
+reaches vehicles while the HUD app is open.
+
 ## Tuning
 
 All constants in one `settings` table at the top of the extension (wear rate
